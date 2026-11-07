@@ -1,0 +1,12 @@
+.database-mcp/
+/target
+**/*.rs.bk
+Cargo.lock.orig
+*.ini.local
+state.json.local
+logs/
+dist/
+
+# private working docs, not published
+docs/ART.md
+docs/PLAN.md

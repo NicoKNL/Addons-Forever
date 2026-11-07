@@ -1,0 +1,69 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-gnu
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-latest
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: mingw toolchain (windows gnu build)
+        if: matrix.os == 'windows-latest'
+        run: |
+          echo "C:\msys64\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+          echo "CC_x86_64_pc_windows_gnu=x86_64-w64-mingw32-gcc" | Out-File -FilePath $env:GITHUB_ENV -Append
+          echo "WINDRES=x86_64-w64-mingw32-windres" | Out-File -FilePath $env:GITHUB_ENV -Append
+      - run: cargo build --release --target ${{ matrix.target }} -p addons-forever-gui
+      - name: package (windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory dist
+          Compress-Archive -Path "target/${{ matrix.target }}/release/addons-forever.exe", README.md, PRIVACY.md -DestinationPath "dist/addons-forever-${{ github.ref_name }}-${{ matrix.target }}.zip"
+      - name: package (linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          mkdir -p dist stage
+          cp target/${{ matrix.target }}/release/addons-forever README.md PRIVACY.md stage/
+          chmod +x stage/addons-forever
+          tar -C stage -czf dist/addons-forever-${{ github.ref_name }}-${{ matrix.target }}.tar.gz addons-forever README.md PRIVACY.md
+      - name: package (macos)
+        if: runner.os == 'macOS'
+        run: bash scripts/macos-bundle.sh ${{ matrix.target }}
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true

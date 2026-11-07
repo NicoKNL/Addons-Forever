@@ -1,0 +1,49 @@
+[package]
+name = "addons-forever-gui"
+description = "Native GUI for the addons-forever WoW: Forever addon manager"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+dirs = "7"
+eframe = { version = "0.37", default-features = false, features = [
+    "glow",
+    "persistence",
+    "default_fonts",
+    "x11",
+    "wayland",
+] }
+egui_extras = { version = "0.37", features = ["image"] }
+egui = "0.37"
+addons-forever-core = { path = "../core" }
+interprocess = "2"
+open = "5"
+png = "0.18"
+rfd = "0.15"
+self_update = { version = "1", default-features = false, features = [
+    "ureq",
+    "rustls",
+    "archive-zip",
+    "github",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "time", "sync"] }
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[[bin]]
+name = "addons-forever"
+path = "src/main.rs"
+
+[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
+tray-icon = "0.26"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_UI_Shell", "Win32_Foundation", "Win32_System_Threading", "Win32_System_Console", "Win32_UI_WindowsAndMessaging"] }

@@ -1,0 +1,21 @@
+[workspace]
+resolver = "2"
+members = ["crates/core", "crates/gui"]
+
+[workspace.package]
+version = "0.3.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/Yoremto/Addons-Forever"
+
+[profile.release]
+opt-level = "s"
+# thin LTO + default codegen units: fat LTO / CGU=1 made every release build
+# pay a near-serial LTO stage; parallel codegen builds ~2x faster for <2% size.
+lto = "thin"
+panic = "abort"
+strip = true
+
+[profile.dev]
+opt-level = 0
