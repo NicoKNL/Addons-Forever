@@ -28,6 +28,9 @@ pub struct DepStatus {
 /// Parse dependency headers from all `.toc` files directly in the given
 /// addon folders (a bundle declares deps in its main TOC; parsing all root
 /// TOCs is safe: duplicates are deduped, preserving order).
+/// Handles the four TOC keys: `Dependencies`, `RequiredDeps` (required) and
+/// `OptionalDependencies`, `OptionalDeps` (optional; the short alias is what
+/// most addons ship, e.g. Questie).
 pub fn declared_dependencies(addons_dir: &Path, folders: &[String]) -> Vec<DeclaredDep> {
     let mut out: Vec<DeclaredDep> = Vec::new();
     for folder in folders {
@@ -43,13 +46,16 @@ pub fn declared_dependencies(addons_dir: &Path, folders: &[String]) -> Vec<Decla
             let Ok(text) = std::fs::read_to_string(&toc) else { continue };
             for line in text.lines().take(80) {
                 let Some(rest) = line.strip_prefix("## ") else { continue };
-                let (header, required) = if let Some(h) = strip_prefix_ci(rest, "Dependencies:") {
-                    (h, true)
-                } else if let Some(h) = strip_prefix_ci(rest, "OptionalDependencies:") {
-                    (h, false)
-                } else {
-                    continue;
-                };
+                let (header, required) =
+                    if let Some(h) = strip_prefix_ci(rest, "Dependencies:").or_else(|| strip_prefix_ci(rest, "RequiredDeps:")) {
+                        (h, true)
+                    } else if let Some(h) = strip_prefix_ci(rest, "OptionalDependencies:")
+                        .or_else(|| strip_prefix_ci(rest, "OptionalDeps:"))
+                    {
+                        (h, false)
+                    } else {
+                        continue;
+                    };
                 for dep in header.split(',') {
                     let dep = dep.trim();
                     if dep.is_empty() || dep.eq_ignore_ascii_case("Blizzard") {
@@ -65,14 +71,76 @@ pub fn declared_dependencies(addons_dir: &Path, folders: &[String]) -> Vec<Decla
     out
 }
 
-/// Which declared deps have no folder in the AddOns dir (case-insensitive).
-pub fn unmet_dependencies(addons_dir: &Path, deps: &[DeclaredDep]) -> Vec<DepStatus> {
+/// Names satisfied from inside the bundle itself: sub-folder names (embedded
+/// libraries live in `Libs/<Name>/` and match by folder name at load time)
+/// plus every `## Title:` found in TOCs within two directory levels
+/// (color codes stripped). Used to keep embedded libraries from being
+/// offered as separate installs.
+pub fn embedded_names(addons_dir: &Path, folders: &[String]) -> Vec<String> {
+    fn titles_in(dir: &Path, out: &mut Vec<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for e in entries.flatten() {
+            let path = e.path();
+            let name = e.file_name().to_string_lossy().to_string();
+            if path.is_dir() {
+                out.push(name.clone());
+                titles_in(&path, out);
+            } else if path.extension().map(|x| x.eq_ignore_ascii_case("toc")).unwrap_or(false) {
+                let Ok(text) = std::fs::read_to_string(&path) else { continue };
+                for line in text.lines().take(40) {
+                    if let Some(t) = strip_prefix_ci(line.strip_prefix("## ").unwrap_or(line), "Title:") {
+                        out.push(strip_color_codes(t));
+                    }
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for folder in folders {
+        out.push(folder.clone());
+        titles_in(&addons_dir.join(folder), &mut out);
+    }
+    out
+}
+
+/// Remove WoW rich-text color codes (`|cAARRGGBB`, `|r`) from TOC titles.
+fn strip_color_codes(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '|' {
+            match chars.peek() {
+                Some('c') => {
+                    chars.next();
+                    for _ in 0..8 {
+                        if chars.peek().map(|x| x.is_ascii_alphanumeric()).unwrap_or(false) {
+                            chars.next();
+                        }
+                    }
+                }
+                Some('r') => {
+                    chars.next();
+                }
+                _ => out.push(c),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out.trim().to_string()
+}
+
+/// Which declared deps have no folder in the AddOns dir (case-insensitive),
+/// excluding names present in `satisfied_extra` (bundle-internal names).
+pub fn unmet_dependencies(addons_dir: &Path, deps: &[DeclaredDep], satisfied_extra: &[String]) -> Vec<DepStatus> {
     let present = |name: &str| -> bool {
-        let Ok(entries) = std::fs::read_dir(addons_dir) else { return false };
-        entries.flatten().any(|e| {
-            e.path().is_dir()
-                && e.file_name().to_string_lossy().eq_ignore_ascii_case(name)
-        })
+        satisfied_extra.iter().any(|s| s.eq_ignore_ascii_case(name))
+            || {
+                let Ok(entries) = std::fs::read_dir(addons_dir) else { return false };
+                entries.flatten().any(|e| {
+                    e.path().is_dir() && e.file_name().to_string_lossy().eq_ignore_ascii_case(name)
+                })
+            }
     };
     deps.iter()
         .map(|d| DepStatus {
@@ -167,7 +235,7 @@ mod tests {
             DeclaredDep { name: "Details".into(), required: true },
             DeclaredDep { name: "MissingLib".into(), required: false },
         ];
-        let unmet = unmet_dependencies(addons, &deps);
+        let unmet = unmet_dependencies(addons, &deps, &[]);
         assert_eq!(unmet.len(), 1);
         assert_eq!(unmet[0].name, "MissingLib");
     }
@@ -190,10 +258,58 @@ mod tests {
     }
 
     #[test]
+    fn questie_shape_optionaldeps_and_embedded_libs() {
+        // Questie declares `## OptionalDeps: QuestieDB, LibStub, Ace3` and
+        // embeds LibStub as `Libs/LibStub/`: embedded names must not be
+        // offered for install; real missing addons must.
+        let tmp = tempfile::tempdir().unwrap();
+        let addons = tmp.path();
+        toc(&addons.join("Questie"), "## Title: Questie\n## OptionalDeps: QuestieDB, LibStub, Ace3\n");
+        toc(&addons.join("Questie/Libs/LibStub"), "## Title: Lib: |cFF00FF00LibStub|r\n");
+        std::fs::create_dir_all(addons.join("Questie/Libs/Ace3")).unwrap();
+        let declared = declared_dependencies(addons, &["Questie".into()]);
+        assert_eq!(declared.len(), 3);
+        assert!(declared.iter().all(|d| !d.required));
+        let embedded = embedded_names(addons, &["Questie".into()]);
+        assert!(embedded.iter().any(|n| n == "LibStub"));
+        assert!(embedded.iter().any(|n| n == "Ace3"));
+        let unmet = unmet_dependencies(addons, &declared, &embedded);
+        assert_eq!(unmet.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(), ["QuestieDB"]);
+    }
+
+    #[test]
+    fn color_codes_stripped_from_titles() {
+        assert_eq!(strip_color_codes("Questie|cFF00FF00 v12|r"), "Questie v12");
+        assert_eq!(strip_color_codes("Lib: |cFF00FF00LibStub|r"), "Lib: LibStub");
+        assert_eq!(strip_color_codes("Plain"), "Plain");
+    }
+
+    #[test]
     fn clean_name_strips_bracket_suffixes() {
         assert_eq!(clean_name("Details! [Ex]"), "Details");
         assert_eq!(clean_name("BigWigs (Classic)"), "BigWigs");
         assert_eq!(clean_name("Cool addon"), "Cool addon");
+    }
+
+    #[test]
+    fn bundle_deps_satisfied_absent_deps_prompt() {
+        // A BigWigs module declares `## Dependencies: BigWigs`.
+        let tmp = tempfile::tempdir().unwrap();
+        let addons = tmp.path();
+        toc(&addons.join("BigWigs_Core"), "## Title: BigWigs Core\n## Dependencies: BigWigs\n");
+        toc(&addons.join("BigWigs"), "## Title: BigWigs\n");
+
+        // Core present: dependency is satisfied, nothing to prompt.
+        let declared = declared_dependencies(addons, &["BigWigs_Core".into()]);
+        assert_eq!(declared.len(), 1);
+        assert!(unmet_dependencies(addons, &declared, &[]).is_empty());
+
+        // Core missing (fresh module install): it surfaces as unmet.
+        std::fs::remove_dir_all(addons.join("BigWigs")).unwrap();
+        let unmet = unmet_dependencies(addons, &declared, &[]);
+        assert_eq!(unmet.len(), 1);
+        assert_eq!(unmet[0].name, "BigWigs");
+        assert!(unmet[0].required);
     }
 
     /// Live provider resolution (FA_LIVE=1 cargo test -- --include-ignored).

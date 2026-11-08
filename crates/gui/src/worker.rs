@@ -309,7 +309,9 @@ impl Worker {
         if declared.is_empty() {
             return;
         }
-        let mut unmet = deps::unmet_dependencies(&dir, &declared);
+        // Embedded libraries and bundle siblings satisfy deps at load time.
+        let present = deps::embedded_names(&dir, folders);
+        let mut unmet = deps::unmet_dependencies(&dir, &declared, &present);
         if unmet.is_empty() {
             return;
         }

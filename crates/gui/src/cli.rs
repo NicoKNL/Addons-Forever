@@ -197,7 +197,8 @@ async fn dispatch(data_dir: &std::path::Path, config_path: &std::path::Path, cfg
             persist_flags(data_dir, &store)?;
             println!("installed {} v{} [{}]", name, outcome.version.unwrap_or_default(), outcome.folders.join(", "));
             let declared = addons_forever_core::engine::deps::declared_dependencies(&addons_dir, &outcome.folders);
-            for dep in addons_forever_core::engine::deps::unmet_dependencies(&addons_dir, &declared) {
+            let present = addons_forever_core::engine::deps::embedded_names(&addons_dir, &outcome.folders);
+            for dep in addons_forever_core::engine::deps::unmet_dependencies(&addons_dir, &declared, &present) {
                 let kind = if dep.required { "required" } else { "optional" };
                 match addons_forever_core::engine::deps::resolve_source(&ctx, &reg, &sel, &dep.name).await {
                     Some((provider, id)) => {

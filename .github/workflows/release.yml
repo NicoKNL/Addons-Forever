@@ -36,15 +36,17 @@ jobs:
         if: matrix.os == 'windows-latest'
         shell: pwsh
         run: |
+          $VERSION = (Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"').Matches[0].Groups[1].Value
           New-Item -ItemType Directory dist
-          Compress-Archive -Path "target/${{ matrix.target }}/release/addons-forever.exe", README.md, PRIVACY.md -DestinationPath "dist/addons-forever-${{ github.ref_name }}-${{ matrix.target }}.zip"
+          Compress-Archive -Path "target/${{ matrix.target }}/release/addons-forever.exe", README.md, PRIVACY.md -DestinationPath "dist/addons-forever-$VERSION-${{ matrix.target }}.zip"
       - name: package (linux)
         if: matrix.os == 'ubuntu-latest'
         run: |
+          VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)"/\1/')
           mkdir -p dist stage
           cp target/${{ matrix.target }}/release/addons-forever README.md PRIVACY.md stage/
           chmod +x stage/addons-forever
-          tar -C stage -czf dist/addons-forever-${{ github.ref_name }}-${{ matrix.target }}.tar.gz addons-forever README.md PRIVACY.md
+          tar -C stage -czf dist/addons-forever-$VERSION-${{ matrix.target }}.tar.gz addons-forever README.md PRIVACY.md
       - name: package (macos)
         if: runner.os == 'macOS'
         run: bash scripts/macos-bundle.sh ${{ matrix.target }}
