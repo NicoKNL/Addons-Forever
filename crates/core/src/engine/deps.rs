@@ -1,0 +1,218 @@
+//! Addon dependency support: parse `## Dependencies:` / `## OptionalDependencies:`
+//! from installed TOC files, detect which are missing from the AddOns folder,
+//! and resolve missing ones to an installable source by exact name search.
+
+use std::path::Path;
+
+use crate::providers::Registry;
+use crate::types::{AppCtx, FileSelect, ProviderKind};
+
+/// One dependency as declared by the addon.
+#[derive(Clone, Debug)]
+pub struct DeclaredDep {
+    pub name: String,
+    pub required: bool,
+}
+
+/// A declared dependency with its resolution state against the folder.
+#[derive(Clone, Debug)]
+pub struct DepStatus {
+    pub name: String,
+    pub required: bool,
+    /// True when a folder with this name already exists in the AddOns dir.
+    pub installed: bool,
+    /// Provider source for installing it, when a provider has an exact-name match.
+    pub source: Option<(ProviderKind, String)>,
+}
+
+/// Parse dependency headers from all `.toc` files directly in the given
+/// addon folders (a bundle declares deps in its main TOC; parsing all root
+/// TOCs is safe: duplicates are deduped, preserving order).
+pub fn declared_dependencies(addons_dir: &Path, folders: &[String]) -> Vec<DeclaredDep> {
+    let mut out: Vec<DeclaredDep> = Vec::new();
+    for folder in folders {
+        let dir = addons_dir.join(folder);
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        let mut tocs: Vec<_> = entries
+            .flatten()
+            .filter(|e| e.path().extension().map(|x| x.eq_ignore_ascii_case("toc")).unwrap_or(false))
+            .map(|e| e.path())
+            .collect();
+        tocs.sort();
+        for toc in tocs {
+            let Ok(text) = std::fs::read_to_string(&toc) else { continue };
+            for line in text.lines().take(80) {
+                let Some(rest) = line.strip_prefix("## ") else { continue };
+                let (header, required) = if let Some(h) = strip_prefix_ci(rest, "Dependencies:") {
+                    (h, true)
+                } else if let Some(h) = strip_prefix_ci(rest, "OptionalDependencies:") {
+                    (h, false)
+                } else {
+                    continue;
+                };
+                for dep in header.split(',') {
+                    let dep = dep.trim();
+                    if dep.is_empty() || dep.eq_ignore_ascii_case("Blizzard") {
+                        continue;
+                    }
+                    if !out.iter().any(|d| d.name.eq_ignore_ascii_case(dep)) {
+                        out.push(DeclaredDep { name: dep.to_string(), required });
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Which declared deps have no folder in the AddOns dir (case-insensitive).
+pub fn unmet_dependencies(addons_dir: &Path, deps: &[DeclaredDep]) -> Vec<DepStatus> {
+    let present = |name: &str| -> bool {
+        let Ok(entries) = std::fs::read_dir(addons_dir) else { return false };
+        entries.flatten().any(|e| {
+            e.path().is_dir()
+                && e.file_name().to_string_lossy().eq_ignore_ascii_case(name)
+        })
+    };
+    deps.iter()
+        .map(|d| DepStatus {
+            name: d.name.clone(),
+            required: d.required,
+            installed: present(&d.name),
+            source: None,
+        })
+        .filter(|s| !s.installed)
+        .collect()
+}
+
+/// Exact, case-insensitive name match against each searchable provider's
+/// top results, in order: CurseForge, WowUp Hub, Tukui, WoWInterface.
+pub async fn resolve_source(ctx: &AppCtx, reg: &Registry, sel: &FileSelect, name: &str) -> Option<(ProviderKind, String)> {
+    for provider in [
+        ProviderKind::Curse,
+        ProviderKind::WowUpHub,
+        ProviderKind::Tukui,
+        ProviderKind::WowInterface,
+    ] {
+        let Ok(page) = reg.get(provider).search(ctx, name, 0, 25, sel).await else {
+            continue;
+        };
+        if let Some(item) = page
+            .items
+            .into_iter()
+            .find(|i| clean_name(&i.name).eq_ignore_ascii_case(&clean_name(name)))
+        {
+            return Some((item.provider, item.external_id));
+        }
+    }
+    None
+}
+
+fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    let bytes = s.as_bytes();
+    // ASCII byte comparison: on a match the prefix occupies whole bytes,
+    // so the slice boundary is a char boundary (TOC lines are UTF-8 and real
+    // addons ship Cyrillic characters, e.g. Details!).
+    if bytes.len() >= prefix.len() && bytes[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes()) {
+        Some(&s[prefix.len()..])
+    } else {
+        None
+    }
+}
+
+/// Strip marketing suffixes from provider result names for matching
+/// ("Details! [Ex]" -> "Details!").
+fn clean_name(s: &str) -> String {
+    let mut out = s;
+    for c in ['[', '('] {
+        out = out.split(c).next().unwrap_or(out);
+    }
+    out.trim().trim_end_matches(['!', '-', ':']).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn toc(dir: &Path, content: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("X.toc"), content).unwrap();
+    }
+
+    #[test]
+    fn parses_dependency_headers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let addons = tmp.path();
+        toc(
+            &addons.join("CoolAddon"),
+            "## Title: Cool\n## Interface: 16001\n## Dependencies: BigWigs, details, Blizzard\n## OptionalDependencies: LibStub\n",
+        );
+        let deps = declared_dependencies(addons, &["CoolAddon".into()]);
+        assert_eq!(deps.len(), 3);
+        assert_eq!(deps[0].name, "BigWigs");
+        assert!(deps[0].required);
+        assert_eq!(deps[1].name, "details");
+        assert_eq!(deps[2].name, "LibStub");
+        assert!(!deps[2].required);
+    }
+
+    #[test]
+    fn unmet_checks_folders_case_insensitively() {
+        let tmp = tempfile::tempdir().unwrap();
+        let addons = tmp.path();
+        std::fs::create_dir_all(addons.join("bigwigs_core")).unwrap();
+        std::fs::create_dir_all(addons.join("Details")).unwrap();
+        let deps = vec![
+            DeclaredDep { name: "BigWigs_Core".into(), required: true },
+            DeclaredDep { name: "Details".into(), required: true },
+            DeclaredDep { name: "MissingLib".into(), required: false },
+        ];
+        let unmet = unmet_dependencies(addons, &deps);
+        assert_eq!(unmet.len(), 1);
+        assert_eq!(unmet[0].name, "MissingLib");
+    }
+
+    #[test]
+    fn non_ascii_toc_lines_do_not_panic() {
+        // The header probe slices every TOC line at a byte offset; a multi-byte
+        // UTF-8 char (Cyrillic ships in real addons, e.g. Details!) straddling
+        // that offset must not panic.
+        let tmp = tempfile::tempdir().unwrap();
+        let addons = tmp.path();
+        std::fs::create_dir_all(addons.join("Details")).unwrap();
+        std::fs::write(
+            addons.join("Details/Details.toc"),
+            "## Title: Details!\n## Author: Arak\u{410}, Team\u{410}rk\n## Dependencies: Details_Lib, CoolAddon\n",
+        )
+        .unwrap();
+        let deps = declared_dependencies(addons, &["Details".into()]);
+        assert_eq!(deps.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(), ["Details_Lib", "CoolAddon"]);
+    }
+
+    #[test]
+    fn clean_name_strips_bracket_suffixes() {
+        assert_eq!(clean_name("Details! [Ex]"), "Details");
+        assert_eq!(clean_name("BigWigs (Classic)"), "BigWigs");
+        assert_eq!(clean_name("Cool addon"), "Cool addon");
+    }
+
+    /// Live provider resolution (FA_LIVE=1 cargo test -- --include-ignored).
+    #[test]
+    #[ignore]
+    fn resolve_source_finds_real_addons() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let cfg = std::sync::Arc::new(crate::config::AppConfig::default());
+            let ctx = crate::types::AppCtx::new(cfg.clone(), "test");
+            let reg = crate::providers::Registry::new(&ctx);
+            let sel = crate::types::FileSelect::from_cfg(&cfg);
+            // AishCore is an established Curse addon published for the Forever
+            // flavor (gameVersionTypeId 88568), so the exact-name search hits.
+            let src = resolve_source(&ctx, &reg, &sel, "AishCore").await;
+            assert!(src.is_some(), "AishCore must resolve on the forever flavor");
+            // a made-up addon resolves to nothing
+            let src = resolve_source(&ctx, &reg, &sel, "Zzznotarealaddon918273645").await;
+            assert!(src.is_none(), "bogus name must not resolve");
+        });
+    }
+}

@@ -6,6 +6,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use addons_forever_core::config::AppConfig;
+use addons_forever_core::engine::deps::{self, DepStatus};
 use addons_forever_core::engine::install::{self, InstallProgress};
 use addons_forever_core::engine::scan;
 use addons_forever_core::engine::update::{self, UpdateInfo};
@@ -64,6 +65,9 @@ pub enum Ev {
         total: u32,
     },
     ChangelogDone { key: String, title: String, text: String },
+    /// A just-installed addon declares dependencies that are missing from the
+    /// AddOns folder; the GUI offers to install them.
+    DepsFound { addon: String, deps: Vec<DepStatus> },
     Log { line: String },
     SelfUpdateDone { info: String },
 }
@@ -296,6 +300,32 @@ impl Worker {
         }
     }
 
+    /// After a successful install: parse the installed folders' TOC dependency
+    /// headers, resolve the missing ones against the providers, and ask the
+    /// GUI to offer them. Never fails the install: resolution errors are logs.
+    async fn check_install_deps(&self, folders: &[String], addon_name: &str) {
+        let Some(dir) = self.addons_dir() else { return };
+        let declared = deps::declared_dependencies(&dir, folders);
+        if declared.is_empty() {
+            return;
+        }
+        let mut unmet = deps::unmet_dependencies(&dir, &declared);
+        if unmet.is_empty() {
+            return;
+        }
+        let reg = Registry::new(&self.ctx);
+        let sel = self.sel(self.cfg.updates.channel);
+        for dep in &mut unmet {
+            dep.source = deps::resolve_source(&self.ctx, &reg, &sel, &dep.name).await;
+            self.log(format!(
+                "dependency of {addon_name}: {} ({})",
+                dep.name,
+                if dep.source.is_some() { "found" } else { "not found in providers" }
+            ));
+        }
+        let _ = self.ev.send(Ev::DepsFound { addon: addon_name.to_string(), deps: unmet });
+    }
+
     async fn do_install_existing(&mut self, key: String) {
         let Some(st) = self.store.addons.get(&key).cloned() else { return };
         let reg = Registry::new(&self.ctx);
@@ -340,6 +370,7 @@ impl Worker {
                 st.cached_remote = Some(meta.clone());
             }
             let _ = ev.send(Ev::InstallDone { key: key.clone(), name: name.clone(), version: outcome.version });
+            self.check_install_deps(&outcome.folders, &name).await;
             Ok(())
         }
         .await;
@@ -413,6 +444,7 @@ impl Worker {
             }
             self.store.upsert(st);
             let _ = ev.send(Ev::InstallDone { key: key.clone(), name: name.clone(), version: outcome.version });
+            self.check_install_deps(&outcome.folders, &name).await;
             Ok(())
         }
         .await;

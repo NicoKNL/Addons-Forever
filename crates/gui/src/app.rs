@@ -64,6 +64,23 @@ pub struct ChangelogView {
     pub open: bool,
 }
 
+/// One row of the dependency prompt.
+#[derive(Clone)]
+pub struct DepEntry {
+    pub name: String,
+    pub required: bool,
+    /// Installable provider source, when a provider has this addon.
+    pub source: Option<(ProviderKind, String)>,
+    pub checked: bool,
+}
+
+/// Prompt shown after an install whose addon declares missing dependencies.
+#[derive(Clone)]
+pub struct DepDialog {
+    pub addon: String,
+    pub entries: Vec<DepEntry>,
+}
+
 pub struct AppGui {
     pub cfg: Arc<AppConfig>,
     pub data_dir: PathBuf,
@@ -83,6 +100,7 @@ pub struct AppGui {
     pub toast: Option<(String, std::time::Instant)>,
     pub discover: DiscoverState,
     pub changelog: Option<ChangelogView>,
+    pub dep_dialog: Option<DepDialog>,
     pub confirm_uninstall: Option<(String, String)>, // key, name
     pub source_editor: Option<SourceEditor>,
     pub settings_form: Option<Box<AppConfig>>,
@@ -136,6 +154,7 @@ impl AppGui {
             toast: None,
             discover: DiscoverState::default(),
             changelog: None,
+            dep_dialog: None,
             confirm_uninstall: None,
             source_editor: None,
             settings_form: None,
@@ -278,6 +297,20 @@ impl AppGui {
             Ev::ChangelogDone { key, title, text } => {
                 let _ = key;
                 self.changelog = Some(ChangelogView { title, text: strip_html(&text), open: true });
+            }
+            Ev::DepsFound { addon, deps } => {
+                self.dep_dialog = Some(DepDialog {
+                    addon,
+                    entries: deps
+                        .into_iter()
+                        .map(|d| DepEntry {
+                            name: d.name,
+                            required: d.required,
+                            checked: d.source.is_some(),
+                            source: d.source,
+                        })
+                        .collect(),
+                });
             }
             Ev::Log { line } => {
                 tracing::info!(target: "worker", "{line}");
@@ -430,6 +463,66 @@ impl AppGui {
     }
 
     pub fn dialogs(&mut self, ctx: &egui::Context) {
+        // dependency prompt: a fresh install declared addons that are not installed
+        if let Some(dlg) = self.dep_dialog.clone() {
+            let mut entries = dlg.entries;
+            let mut cmds: Vec<Cmd> = Vec::new();
+            let mut close = false;
+            egui::Window::new("Dependencies")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.label(format!(
+                        "“{}” declares addons it depends on that are not installed:",
+                        dlg.addon
+                    ));
+                    ui.separator();
+                    egui::ScrollArea::vertical().max_height(240.0).show(ui, |ui| {
+                        for e in entries.iter_mut() {
+                            let mut label = e.name.clone();
+                            label.push_str(if e.required { "  (required)" } else { "  (optional)" });
+                            if e.source.is_none() {
+                                label.push_str("  -  not found in providers");
+                            }
+                            ui.add_enabled_ui(e.source.is_some(), |ui| {
+                                ui.checkbox(&mut e.checked, label);
+                            });
+                        }
+                    });
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        let any = entries.iter().any(|e| e.checked && e.source.is_some());
+                        if ui
+                            .add_enabled(any, egui::Button::new("Install selected"))
+                            .clicked()
+                        {
+                            for e in entries.iter().filter(|e| e.checked) {
+                                if let Some((provider, id)) = &e.source {
+                                    cmds.push(Cmd::InstallNew {
+                                        provider: *provider,
+                                        external_id: id.clone(),
+                                        name: e.name.clone(),
+                                    });
+                                }
+                            }
+                            close = true;
+                        }
+                        if ui.button("Skip").clicked() {
+                            close = true;
+                        }
+                    });
+                });
+            for c in cmds {
+                self.send(c);
+            }
+            if close {
+                self.dep_dialog = None;
+            } else if let Some(cur) = &mut self.dep_dialog {
+                cur.entries = entries;
+            }
+        }
+
         // per-addon options (channel / ignore / source)
         if let Some(key) = self.addon_menu.clone() {
             let Some(a) = self.addons.iter().find(|x| x.key == key).cloned() else {

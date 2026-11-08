@@ -13,7 +13,7 @@ use crate::store::{AddonState, PendingUpdate, StateStore};
 use crate::types::{
     AppCtx, FileSelect, ProviderKind, RemoteFile, RemoteMeta,
 };
-use crate::util::{version_is_newer, version_key};
+use crate::util::{version_cmp, version_is_newer, version_key};
 
 use super::install::{self, InstallProgress};
 
@@ -74,9 +74,10 @@ pub(crate) fn update_needed(state: &AddonState, target: &RemoteFile) -> bool {
         return state
             .installed_version
             .as_deref()
-            // Numeric identity counts as up to date: a TOC saying "1.60.28"
-            // matches a published "1.60.28-forever" file (author flavor suffix).
-            .map(|v| version_key(v.trim()) != version_key(target.version.trim()))
+            // Identity counts as up to date: "1.60.28" matches published
+            // "1.60.28-forever" (client suffix carries no ordering info), while
+            // "1.0.0c" vs "1.0.0d" (letter suffixes) is a real update.
+            .map(|v| version_cmp(v.trim(), target.version.trim()) != std::cmp::Ordering::Equal)
             .unwrap_or(true);
     };
     if installed == target.file_id {
@@ -528,6 +529,12 @@ mod tests {
         assert!(!update_needed(&st, &f), "1.60.28 vs 1.60.28-forever is the same version");
         f.version = "1.60.29-forever".into();
         assert!(update_needed(&st, &f), "1.60.29-forever is newer than 1.60.28");
+        // letter-suffix versions are real updates
+        st.installed_version = Some("1.0.0c".into());
+        f.version = "1.0.0d".into();
+        assert!(update_needed(&st, &f), "1.0.0d is newer than 1.0.0c");
+        f.version = "1.0.0c".into();
+        assert!(!update_needed(&st, &f), "1.0.0c is the same as 1.0.0c");
     }
 
     #[test]

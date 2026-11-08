@@ -196,6 +196,34 @@ async fn dispatch(data_dir: &std::path::Path, config_path: &std::path::Path, cfg
             store.upsert(st);
             persist_flags(data_dir, &store)?;
             println!("installed {} v{} [{}]", name, outcome.version.unwrap_or_default(), outcome.folders.join(", "));
+            let declared = addons_forever_core::engine::deps::declared_dependencies(&addons_dir, &outcome.folders);
+            for dep in addons_forever_core::engine::deps::unmet_dependencies(&addons_dir, &declared) {
+                let kind = if dep.required { "required" } else { "optional" };
+                match addons_forever_core::engine::deps::resolve_source(&ctx, &reg, &sel, &dep.name).await {
+                    Some((provider, id)) => {
+                        // render a target this CLI's parser accepts (see parse_install_url)
+                        let target = match provider {
+                            ProviderKind::WowInterface => {
+                                format!("https://www.wowinterface.com/downloads/info{id}")
+                            }
+                            ProviderKind::WowUpHub => String::new(),
+                            _ => id.clone(),
+                        };
+                        if target.is_empty() {
+                            println!(
+                                "dependency {} ({}) - on {} (id {id}), install it from Discover in the GUI",
+                                dep.name, kind, provider.label()
+                            );
+                        } else {
+                            println!(
+                                "dependency {} ({}) - install with: cli install {target}",
+                                dep.name, kind
+                            );
+                        }
+                    }
+                    None => println!("dependency {} ({}) - not found in providers", dep.name, kind),
+                }
+            }
         }
         "uninstall" => {
             let needle = args.get(1).ok_or("usage: cli uninstall <name|key>")?.to_lowercase();

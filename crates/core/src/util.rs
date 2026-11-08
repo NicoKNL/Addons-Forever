@@ -44,9 +44,56 @@ pub fn version_key(v: &str) -> Vec<u64> {
     out
 }
 
+/// Trailing client tokens on published versions (`1.60.28-forever`,
+/// `1.2.3_wotlk`) carry no ordering information; strip them before comparing.
+pub fn strip_flavor_suffix(v: &str) -> String {
+    const TOKENS: [&str; 9] = [
+        "forever", "camelot", "mainline", "retail", "classic", "classic_beta", "tbc", "wotlk", "vanilla",
+    ];
+    let mut out = v.trim().to_lowercase();
+    for tok in TOKENS {
+        for sep in ["-", "_", " "] {
+            if let Some(stripped) = out.strip_suffix(&format!("{sep}{tok}")) {
+                out = stripped.to_string();
+            }
+        }
+    }
+    out
+}
+
+/// Split into `(number, letter-suffix)` segments: `"1.0.0d"` ->
+/// `[(1,""),(0,""),(0,"d")]`, so letter suffixes order (`d` > `c`).
+pub fn version_parts(v: &str) -> Vec<(u64, String)> {
+    let mut out = Vec::new();
+    for seg in strip_flavor_suffix(v).split(|c: char| !(c.is_ascii_alphanumeric() && c.is_ascii())) {
+        if seg.is_empty() {
+            continue;
+        }
+        // strip a leading letter prefix ("v1", "ver2"): version tags, not ordering data
+        let seg = seg.trim_start_matches(|c: char| c.is_ascii_alphabetic());
+        let digits: String = seg.chars().take_while(|c| c.is_ascii_digit()).collect();
+        let letters: String = seg[digits.len()..].to_string();
+        out.push((digits.parse::<u64>().unwrap_or(0), letters));
+    }
+    out
+}
+
+/// Compare two version strings with letter suffixes honored.
+pub fn version_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    let (mut pa, mut pb) = (version_parts(a), version_parts(b));
+    let n = pa.len().max(pb.len());
+    while pa.len() < n {
+        pa.push((0, String::new()));
+    }
+    while pb.len() < n {
+        pb.push((0, String::new()));
+    }
+    pa.cmp(&pb)
+}
+
 /// `Some(Ordering)`-style compare: returns true if `a` is newer than `b`.
 pub fn version_is_newer(a: &str, b: &str) -> bool {
-    version_key(a).as_slice() > version_key(b).as_slice()
+    version_cmp(a, b) == std::cmp::Ordering::Greater
 }
 
 /// Case-insensitive path lookup: resolve `rel` (with `/` separators) under `base`
@@ -90,6 +137,13 @@ mod tests {
         assert!(!version_is_newer("1.6.0", "1.60.1"));
         assert!(version_is_newer("v1.5.1-forever", "1.5.0"));
         assert_eq!(version_key("v427.8"), vec![427, 8]);
+        // letter suffixes order
+        assert!(version_is_newer("1.0.0d", "1.0.0c"));
+        assert!(version_is_newer("1.0.1", "1.0.0d"));
+        assert!(version_is_newer("1.0.0c", "1.0.0"));
+        assert!(!version_is_newer("1.0.0c", "1.0.0d"));
+        assert_eq!(version_cmp("1.60.28-forever", "1.60.28"), std::cmp::Ordering::Equal);
+        assert_eq!(version_cmp("2.0.0b-WOTLK", "2.0.0b"), std::cmp::Ordering::Equal);
     }
 
     #[test]
