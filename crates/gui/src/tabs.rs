@@ -108,7 +108,7 @@ pub fn addons_tab(app: &mut AppGui, ui: &mut egui::Ui) {
     // unwrapped and un-truncated when the window allows, columns grow and
     // shrink with the window, and the table spans the full panel width.
     // The Auto column is a fixed-width control column.
-    const AUTO_W: f32 = 74.0;
+    const AUTO_W: f32 = 58.0;
     const ACTIONS_W: f32 = 305.0;
     // floors (col 1..6): below these, labels start truncating
     const ADDONS_MIN: [f32; 6] = [120.0, 64.0, 64.0, 48.0, 56.0, ACTIONS_W];
@@ -204,7 +204,7 @@ pub fn addons_tab(app: &mut AppGui, ui: &mut egui::Ui) {
             h.col(|ui| { ui.weak("Actions"); });
         })
         .body(|body| {
-            body.rows(32.0, rows.len(), |mut row| {
+            body.rows(38.0, rows.len(), |mut row| {
                 let a = rows[row.index()].clone();
                 let has_update = updates.contains(&a.key);
 
