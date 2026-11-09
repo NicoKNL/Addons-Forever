@@ -10,6 +10,7 @@ dist/
 # private working docs, not published
 docs/ART.md
 docs/PLAN.md
+docs/reviews
 
 # github social preview (site asset, not source)
 social-preview.png
