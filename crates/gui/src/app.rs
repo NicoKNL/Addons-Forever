@@ -348,7 +348,6 @@ impl AppGui {
         // Uniform control height across the bar (matches the discover toolbar),
         // so buttons, the filter field and the flavor combo share a centerline.
         ui.style_mut().spacing.interact_size.y = 30.0;
-        ui.style_mut().spacing.item_spacing.y = 30.0;
 
         ui.horizontal(|ui| {
             let scanning = self.scanning;
@@ -384,10 +383,12 @@ impl AppGui {
                 cmds.push(Cmd::ApplyAll);
             }
 
-            ui.separator();
+            ui.add_space(6.0);
             ui.add_sized(
                 [240.0, 30.0],
-                egui::TextEdit::singleline(&mut self.filter).hint_text("filter addons..."),
+                egui::TextEdit::singleline(&mut self.filter)
+                    .hint_text("filter addons...")
+                    .margin(egui::Margin::symmetric(8, 8)),
             );
             if !self.filter.is_empty() && ui.button("✕").clicked() {
                 self.filter.clear();
@@ -851,7 +852,7 @@ impl eframe::App for AppGui {
         self.zoom_shortcuts(&ui.ctx().clone());
         egui::Panel::top("top").show(ui, |ui| {
             self.top_bar(ui);
-            ui.separator();
+            ui.add_space(2.0);
             self.tab_bar(ui);
         });
         egui::Panel::bottom("status").show(ui, |ui| {
