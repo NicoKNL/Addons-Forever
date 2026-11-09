@@ -4,7 +4,7 @@
 //! them after table rows render, keeping egui's borrow model happy.
 
 use egui_extras::{Column, TableBuilder};
-use addons_forever_core::config::AppConfig;
+use addons_forever_core::config::{AppConfig, Theme};
 use addons_forever_core::flavor::Flavor;
 use addons_forever_core::types::{Channel, ProviderKind};
 
@@ -20,6 +20,26 @@ pub const ART_BADGE_UPDATE: &[u8] = include_bytes!("../../../assets/badge-update
 
 pub fn art(bytes: &'static [u8], uri: &'static str, max_w: f32, max_h: f32) -> egui::Image<'static> {
     egui::Image::from_bytes(uri, bytes).max_size(egui::vec2(max_w, max_h))
+}
+
+/// Status text colors, readable on the active theme's background (egui follows
+/// the OS appearance, so light mode needs darker tones than dark mode).
+pub enum Tone {
+    Good,
+    Warn,
+    Bad,
+}
+
+pub fn tone(ui: &egui::Ui, tone: Tone) -> egui::Color32 {
+    let dark = ui.visuals().dark_mode;
+    match tone {
+        Tone::Good if dark => egui::Color32::from_rgb(140, 230, 140),
+        Tone::Good => egui::Color32::from_rgb(30, 125, 50),
+        Tone::Warn if dark => egui::Color32::GOLD,
+        Tone::Warn => egui::Color32::from_rgb(160, 100, 0),
+        Tone::Bad if dark => egui::Color32::from_rgb(255, 130, 130),
+        Tone::Bad => egui::Color32::from_rgb(185, 30, 30),
+    }
 }
 
 enum Act {
@@ -243,7 +263,7 @@ pub fn addons_tab(app: &mut AppGui, ui: &mut egui::Ui) {
                     if has_update {
                         let v = a.pending_update.as_ref().map(|p| p.version.clone()).unwrap_or_default();
                         ui.add(
-                            egui::Label::new(egui::RichText::new(v).color(egui::Color32::from_rgb(140, 230, 140)).small().strong())
+                            egui::Label::new(egui::RichText::new(v).color(tone(ui, Tone::Good)).small().strong())
                                 .truncate(),
                         );
                     } else {
@@ -896,6 +916,17 @@ pub fn settings_tab(app: &mut AppGui, ui: &mut egui::Ui) {
 
         ui.group(|ui| {
             ui.heading("Interface");
+            ui.horizontal(|ui| {
+                ui.label("Theme");
+                egui::ComboBox::from_id_salt("set-theme")
+                    .selected_text(form.ui.theme.label())
+                    .show_ui(ui, |ui| {
+                        for t in Theme::ALL {
+                            ui.selectable_value(&mut form.ui.theme, t, t.label());
+                        }
+                    });
+                ui.label(egui::RichText::new("applies after Save").small().weak());
+            });
             ui.checkbox(&mut form.ui.minimize_to_tray, "Close button minimizes to the system tray (Windows)")
                 .on_hover_text("Available in the Windows build");
             ui.horizontal(|ui| {
@@ -1058,7 +1089,7 @@ pub fn log_tab(app: &mut AppGui, ui: &mut egui::Ui) {
             for line in app.logs.iter() {
                 let text = egui::RichText::new(line.clone()).monospace().small();
                 let resp = if line.contains("FAILED") || line.to_lowercase().contains("failed") {
-                    ui.colored_label(egui::Color32::from_rgb(255, 140, 140), text)
+                    ui.colored_label(tone(ui, Tone::Bad), text)
                 } else {
                     ui.label(text)
                 };

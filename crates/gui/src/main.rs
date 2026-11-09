@@ -125,6 +125,15 @@ fn setup_style(ctx: &egui::Context) {
         }
         ctx.set_fonts(defs);
     }
+    // Sizes and spacing for both themes: egui follows the OS appearance, and
+    // light mode otherwise keeps egui's defaults (9 pt Small next to 13 pt Body).
+    ctx.all_styles_mut(|style| {
+        style.spacing.item_spacing = egui::vec2(7.0, 5.0);
+        style.text_styles.insert(egui::TextStyle::Body, egui::FontId::proportional(15.5));
+        style.text_styles.insert(egui::TextStyle::Button, egui::FontId::proportional(15.0));
+        style.text_styles.insert(egui::TextStyle::Heading, egui::FontId::proportional(19.0));
+        style.text_styles.insert(egui::TextStyle::Small, egui::FontId::proportional(13.0));
+    });
     ctx.style_mut_of(egui::Theme::Dark, |style| {
         style.visuals = egui::Visuals::dark();
         style.visuals.panel_fill = egui::Color32::from_rgb(24, 26, 31);
@@ -135,11 +144,6 @@ fn setup_style(ctx: &egui::Context) {
         style.visuals.widgets.hovered.fg_stroke.color = egui::Color32::WHITE;
         style.visuals.widgets.active.fg_stroke.color = egui::Color32::WHITE;
         style.visuals.weak_text_color = Some(egui::Color32::from_gray(188));
-        style.spacing.item_spacing = egui::vec2(7.0, 5.0);
-        style.text_styles.insert(egui::TextStyle::Body, egui::FontId::proportional(15.5));
-        style.text_styles.insert(egui::TextStyle::Button, egui::FontId::proportional(15.0));
-        style.text_styles.insert(egui::TextStyle::Heading, egui::FontId::proportional(19.0));
-        style.text_styles.insert(egui::TextStyle::Small, egui::FontId::proportional(13.0));
     });
 }
 

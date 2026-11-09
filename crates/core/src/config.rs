@@ -114,10 +114,49 @@ impl Default for NetworkSection {
     }
 }
 
+/// Color theme: follow the OS appearance, or force one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Theme {
+    #[default]
+    System,
+    Dark,
+    Light,
+}
+
+impl Theme {
+    pub const ALL: [Theme; 3] = [Theme::System, Theme::Dark, Theme::Light];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Theme::System => "system",
+            Theme::Dark => "dark",
+            Theme::Light => "light",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Theme::System => "Follow system",
+            Theme::Dark => "Dark",
+            Theme::Light => "Light",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Theme> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "system" | "auto" => Some(Theme::System),
+            "dark" => Some(Theme::Dark),
+            "light" => Some(Theme::Light),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UiSection {
-    pub theme: String,
+    pub theme: Theme,
     /// UI scale multiplier applied on top of the OS DPI scaling (0.5 .. 2.5).
     pub scale: f32,
     pub minimize_to_tray: bool,
@@ -129,7 +168,7 @@ pub struct UiSection {
 impl Default for UiSection {
     fn default() -> Self {
         UiSection {
-            theme: "dark".into(),
+            theme: Theme::System,
             scale: 1.0,
             minimize_to_tray: false,
             scan_on_start: true,
@@ -200,7 +239,7 @@ impl AppConfig {
         kv_bool(&mut s, "offline", self.network.offline);
         s.push('\n');
         s.push_str("[ui]\n");
-        kv(&mut s, "theme", &self.ui.theme);
+        kv(&mut s, "theme", self.ui.theme.as_str());
         kv(&mut s, "scale", &self.ui.scale.to_string());
         kv_bool(&mut s, "minimize_to_tray", self.ui.minimize_to_tray);
         kv_bool(&mut s, "scan_on_start", self.ui.scan_on_start);
@@ -299,7 +338,9 @@ fn cfg_from_ini(ini: &Ini) -> Result<AppConfig> {
         cfg.network.offline = s.get("offline").map(|v| parse_bool(v, false)).unwrap_or(false);
     }
     if let Some(s) = ini.section(Some("ui")) {
-        cfg.ui.theme = s.get("theme").unwrap_or("dark").to_string();
+        if let Some(v) = s.get("theme").and_then(Theme::parse) {
+            cfg.ui.theme = v;
+        }
         if let Some(v) = s.get("scale").and_then(|v| v.trim().parse::<f32>().ok()) {
             cfg.ui.scale = v.clamp(0.5, 2.5);
         }
@@ -434,6 +475,20 @@ pub fn autodetect_addons_dir(flavor: Flavor) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn theme_roundtrip_and_fallback() {
+        for t in Theme::ALL {
+            let mut cfg = AppConfig::default();
+            cfg.ui.theme = t;
+            let ini = Ini::load_from_str(&cfg.to_ini_text()).unwrap();
+            assert_eq!(cfg_from_ini(&ini).unwrap().ui.theme, t);
+        }
+        let ini = Ini::load_from_str("[ui]\ntheme = purple\n").unwrap();
+        assert_eq!(cfg_from_ini(&ini).unwrap().ui.theme, Theme::System);
+        let ini = Ini::load_from_str("[ui]\ntheme = Light\n").unwrap();
+        assert_eq!(cfg_from_ini(&ini).unwrap().ui.theme, Theme::Light);
+    }
 
     #[test]
     fn ini_roundtrip() {
