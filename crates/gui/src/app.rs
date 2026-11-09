@@ -345,12 +345,16 @@ impl AppGui {
 
     pub fn top_bar(&mut self, ui: &mut egui::Ui) {
         let mut cmds: Vec<Cmd> = Vec::new();
+        // Uniform control height across the bar (matches the discover toolbar),
+        // so buttons, the filter field and the flavor combo share a centerline.
+        ui.style_mut().spacing.interact_size.y = 30.0;
+        ui.style_mut().spacing.item_spacing.y = 30.0;
 
         ui.horizontal(|ui| {
             let scanning = self.scanning;
             let scan_lbl = if scanning { "Scanning\u{2026}" } else { "Scan" };
             if ui
-                .add_enabled(!scanning, egui::Button::new(scan_lbl))
+                .add_enabled(!scanning, egui::Button::new(scan_lbl).min_size(egui::vec2(0.0, 30.0)))
                 .on_hover_text("Re-scan the AddOns folder")
                 .clicked()
             {
@@ -360,7 +364,7 @@ impl AppGui {
             let checking = self.checking;
             let chk_lbl = if checking { "Checking\u{2026}" } else { "Check updates" };
             if ui
-                .add_enabled(!checking, egui::Button::new(chk_lbl))
+                .add_enabled(!checking, egui::Button::new(chk_lbl).min_size(egui::vec2(0.0, 30.0)))
                 .on_hover_text("Check for addon updates")
                 .clicked()
             {
@@ -373,7 +377,7 @@ impl AppGui {
             let n = self.updates.len();
             let label = if n > 0 { format!("Update all ({n})") } else { "Update all".into() };
             if ui
-                .add_enabled(n > 0, egui::Button::new(label))
+                .add_enabled(n > 0, egui::Button::new(label).min_size(egui::vec2(0.0, 30.0)))
                 .on_hover_text("Install all available updates")
                 .clicked()
             {
@@ -382,10 +386,10 @@ impl AppGui {
 
             ui.separator();
             ui.add_sized(
-                [240.0, 0.0],
+                [240.0, 30.0],
                 egui::TextEdit::singleline(&mut self.filter).hint_text("filter addons..."),
             );
-            if !self.filter.is_empty() && ui.small_button("✕").clicked() {
+            if !self.filter.is_empty() && ui.button("✕").clicked() {
                 self.filter.clear();
             }
 
