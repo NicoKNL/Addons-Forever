@@ -27,7 +27,7 @@ use crate::types::{
 
 /// Result of one full AddOns scan: provider-matched addons, folders no
 /// provider claimed, and the scan timestamp (unix seconds).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ScanReport {
     pub matched: Vec<ScanMatch>,
     pub unmatched: Vec<FolderInfo>,
@@ -348,6 +348,42 @@ mod tests {
         )
         .unwrap();
         std::fs::write(dir.join(format!("{folder}.lua")), format!("-- {folder}\n")).unwrap();
+    }
+
+    /// A missing AddOns folder (flavor not installed) must fail fast: the GUI
+    /// depends on scan completion to leave the "Scanning..." state.
+    #[test]
+    fn scan_missing_dir_errors_fast_never_hangs() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let c = ctx();
+            let missing = std::path::Path::new("/nonexistent-addon-dir-xyz/AddOns");
+            let res = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                scan_addons(&c, missing, &sel(), &mut |_, _, _| {}),
+            )
+            .await;
+            assert!(res.as_ref().is_ok_and(|r| r.is_err()), "missing dir must error, not hang: {res:?}");
+        });
+    }
+
+    /// An empty folder succeeds with an empty report (switching to an
+    /// installed-but-empty client must rescan cleanly).
+    #[test]
+    fn scan_empty_dir_ok() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let c = ctx();
+            let rep = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                scan_addons(&c, tmp.path(), &sel(), &mut |_, _, _| {}),
+            )
+            .await
+            .expect("empty scan must not hang")
+            .expect("empty dir must scan ok");
+            assert!(rep.matched.is_empty() && rep.unmatched.is_empty());
+        });
     }
 
     fn fixture() -> (tempfile::TempDir, PathBuf) {

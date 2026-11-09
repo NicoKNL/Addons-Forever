@@ -410,8 +410,13 @@ impl AppGui {
                             {
                                 let mut c = (*self.cfg).clone();
                                 c.app.flavor = *f;
-                                self.cfg = Arc::new(c.clone());
-                                cmds.push(Cmd::SaveConfig(Box::new(c)));
+                                self.cfg = Arc::new(c);
+                                // the worker persists, restores that flavor's
+                                // list from cache and rescans
+                                self.updates.clear();
+                                self.busy.clear();
+                                self.job = None;
+                                self.send(Cmd::SetFlavor(*f));
                             }
                         }
                     });

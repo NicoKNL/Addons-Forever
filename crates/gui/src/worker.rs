@@ -19,6 +19,9 @@ use addons_forever_core::types::{AppCtx, Channel, FileSelect, ProviderKind, Sear
 #[derive(Debug, Clone)]
 pub enum Cmd {
     Rescan,
+    /// Switch client flavor: drop the running scan, restore that flavor's
+    /// list from the session cache (or clear), and rescan its folder.
+    SetFlavor(addons_forever_core::flavor::Flavor),
     Check,
     ApplyAll,
     /// Install updates for a single addon.
@@ -46,6 +49,8 @@ pub enum Cmd {
     CheckAppUpdate,
     /// Install the app update (swap + restart-on-next-launch).
     SelfUpdate,
+    /// Result of a background scan; dropped when a newer scan has started.
+    ScanFinished { gen: u64, report: Box<scan::ScanReport> },
 }
 
 #[derive(Debug, Clone)]
@@ -104,6 +109,7 @@ pub struct ExportManifest {
 
 pub fn spawn(cfg: Arc<AppConfig>, data_dir: PathBuf, app_version: &'static str) -> WorkerHandle {
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<Cmd>();
+    let handle_tx = cmd_tx.clone();
     let (ev_tx, ev_rx) = mpsc::unbounded_channel::<Ev>();
 
     std::thread::Builder::new()
@@ -115,20 +121,28 @@ pub fn spawn(cfg: Arc<AppConfig>, data_dir: PathBuf, app_version: &'static str) 
                 .build()
                 .expect("tokio runtime");
             rt.block_on(async move {
-                run(&mut cmd_rx, &ev_tx, cfg, data_dir, app_version).await;
+                run(cmd_tx.clone(), &mut cmd_rx, &ev_tx, cfg, data_dir, app_version).await;
             });
         })
         .expect("spawn worker thread");
 
-    WorkerHandle { tx: cmd_tx, rx: ev_rx }
+    WorkerHandle { tx: handle_tx, rx: ev_rx }
 }
 
 struct Worker {
     ev: mpsc::UnboundedSender<Ev>,
+    /// Sends ScanFinished back into the command loop (spawned scans).
+    cmd_tx: mpsc::UnboundedSender<Cmd>,
     cfg: Arc<AppConfig>,
     ctx: AppCtx,
     data_dir: PathBuf,
     store: StateStore,
+    /// Bumped on every scan start / flavor switch: running scans carry the
+    /// generation they started with and are dropped when it goes stale.
+    gen: u64,
+    /// Scanned lists per flavor for this session: switching flavors shows the
+    /// known state instantly, then the rescan refreshes it.
+    flavor_cache: std::collections::HashMap<addons_forever_core::flavor::Flavor, Vec<AddonState>>,
     _watcher: Option<scan::WatcherHandle>,
     watcher_tx: mpsc::UnboundedSender<()>,
     watcher_rx: mpsc::UnboundedReceiver<()>,
@@ -186,20 +200,104 @@ impl Worker {
         }
     }
 
+    /// Background scan with a hard timeout, so an unreachable folder
+    /// (flavor not installed, network share asleep) can never hang.
+    /// The result is delivered as Cmd::ScanFinished and dropped if a newer
+    /// scan (or a flavor switch) superseded it.
+    fn start_scan(&mut self) {
+        let Some(dir) = self.addons_dir() else {
+            self.log("scan: no AddOns directory configured");
+            let _ = self.ev.send(Ev::ScanDone { matched: 0, unmatched: 0 });
+            return;
+        };
+        self.gen += 1;
+        let gen = self.gen;
+        let ctx = self.ctx.clone();
+        let sel = self.sel(self.cfg.updates.channel);
+        let ev = self.ev.clone();
+        let tx = self.cmd_tx.clone();
+        tokio::spawn(async move {
+            let mut progress = |folder: &str, done: usize, total: usize| {
+                let _ = ev.send(Ev::ScanProgress { folder: folder.to_string(), done, total });
+            };
+            let fut = scan::scan_addons(&ctx, &dir, &sel, &mut progress);
+            match tokio::time::timeout(std::time::Duration::from_secs(120), fut).await {
+                Ok(Ok(report)) => {
+                    let _ = tx.send(Cmd::ScanFinished { gen, report: Box::new(report) });
+                }
+                Ok(Err(e)) => {
+                    let _ = ev.send(Ev::Failed { key: String::new(), msg: format!("Scan: {e}") });
+                }
+                Err(_) => {
+                    let _ = ev.send(Ev::Failed {
+                        key: String::new(),
+                        msg: "Scan timed out after 120s (folder unreadable or provider unreachable)".into(),
+                    });
+                }
+            }
+        });
+    }
+
+    /// Remember the live store under `flavor` for instant switching back.
+    fn cache_flavor_store(&mut self, flavor: addons_forever_core::flavor::Flavor) {
+        let cur: Vec<AddonState> = self.store.addons.values().cloned().collect();
+        self.flavor_cache.insert(flavor, cur);
+    }
+
+    /// Swap the live store to `flavor`'s cached list, or clear it when the
+    /// flavor was not scanned this session.
+    fn restore_flavor_store(&mut self, flavor: addons_forever_core::flavor::Flavor) {
+        self.store = match self.flavor_cache.get(&flavor) {
+            Some(list) => {
+                let mut st = StateStore::default();
+                for a in list {
+                    st.upsert(a.clone());
+                }
+                st
+            }
+            None => StateStore::default(),
+        };
+    }
+
+    /// Switch the client flavor: cancel any running scan, swap to that
+    /// flavor's cached list (or clear the view), persist, and rescan.
+    async fn do_set_flavor(&mut self, flavor: addons_forever_core::flavor::Flavor) {
+        if self.cfg.app.flavor == flavor {
+            return;
+        }
+        let old = self.cfg.app.flavor;
+        self.cache_flavor_store(old);
+        self.gen += 1; // supersede running scans
+        let mut c = (*self.cfg).clone();
+        c.app.flavor = flavor;
+        self.cfg = Arc::new(c);
+        self.ctx = AppCtx::new(self.cfg.clone(), self.ctx.app_version);
+        let path = addons_forever_core::config::AppConfig::config_path(&self.data_dir);
+        if let Err(e) = self.cfg.save(&path) {
+            self.log(format!("config save failed: {e}"));
+        }
+        self.restore_flavor_store(flavor);
+        self.setup_watcher();
+        self.log(format!("switched to {}; rescanning", flavor.label()));
+        self.emit_state();
+        self.start_scan();
+    }
+
     async fn do_scan(&mut self) {
         let Some(dir) = self.addons_dir() else {
             self.log("scan: no AddOns directory configured");
+            let _ = self.ev.send(Ev::ScanDone { matched: 0, unmatched: 0 });
             return;
         };
         let ev = self.ev.clone();
         let sel = self.sel(self.cfg.updates.channel);
         self.log(format!("scanning {}", dir.display()));
-        match scan::scan_addons(&self.ctx, &dir, &sel, &mut |folder, done, total| {
+        let mut progress = |folder: &str, done: usize, total: usize| {
             let _ = ev.send(Ev::ScanProgress { folder: folder.to_string(), done, total });
-        })
-        .await
-        {
-            Ok(report) => {
+        };
+        let fut = scan::scan_addons(&self.ctx, &dir, &sel, &mut progress);
+        match tokio::time::timeout(std::time::Duration::from_secs(120), fut).await {
+            Ok(Ok(report)) => {
                 let matched = report.matched.len();
                 let unmatched = report.unmatched.len();
                 scan::apply_scan_report(&mut self.store, &report, &self.cfg);
@@ -207,9 +305,16 @@ impl Worker {
                 self.log(format!("scan done: {matched} matched, {unmatched} unmanaged"));
                 let _ = self.ev.send(Ev::ScanDone { matched, unmatched });
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 self.log(format!("scan failed: {e}"));
                 let _ = self.ev.send(Ev::Failed { key: String::new(), msg: format!("Scan: {e}") });
+            }
+            Err(_) => {
+                self.log("scan timed out");
+                let _ = self.ev.send(Ev::Failed {
+                    key: String::new(),
+                    msg: "Scan timed out after 120s (folder unreadable or provider unreachable)".into(),
+                });
             }
         }
     }
@@ -623,11 +728,23 @@ impl Worker {
             let _ = self.ev.send(Ev::Failed { key: "config".into(), msg: format!("Save: {e}") });
             return;
         }
+        let old_flavor = self.cfg.app.flavor;
         self.cfg = Arc::new(new_cfg);
         self.ctx = AppCtx::new(self.cfg.clone(), self.ctx.app_version);
         self.setup_watcher();
         self.log("settings saved");
         self.emit_state();
+        // flavor changed via the settings form: cache swap + rescan like the
+        // top-bar switch
+        if self.cfg.app.flavor != old_flavor {
+            self.cache_flavor_store(old_flavor);
+            self.gen += 1;
+            let f = self.cfg.app.flavor;
+            self.restore_flavor_store(f);
+            self.log(format!("switched to {}; rescanning", f.label()));
+            self.emit_state();
+            self.start_scan();
+        }
     }
 
     /// Query the app release feed. On startup (`manual == false`) a found
@@ -735,6 +852,7 @@ fn phase_str(p: &InstallProgress) -> &'static str {
 }
 
 async fn run(
+    cmd_tx: mpsc::UnboundedSender<Cmd>,
     cmd_rx: &mut mpsc::UnboundedReceiver<Cmd>,
     ev: &mpsc::UnboundedSender<Ev>,
     cfg: Arc<AppConfig>,
@@ -751,10 +869,13 @@ async fn run(
     let (watcher_tx, watcher_rx) = mpsc::unbounded_channel();
     let mut w = Worker {
         ev: ev.clone(),
+        cmd_tx,
         cfg: cfg.clone(),
         ctx: AppCtx::new(cfg.clone(), app_version),
         data_dir: data_dir.clone(),
         store,
+        gen: 0,
+        flavor_cache: std::collections::HashMap::new(),
         _watcher: None,
         watcher_tx,
         watcher_rx,
@@ -790,7 +911,20 @@ async fn run(
             cmd = cmd_rx.recv() => {
                 let Some(cmd) = cmd else { break };
                 match cmd {
-                    Cmd::Rescan => w.do_scan().await,
+                    Cmd::Rescan => w.start_scan(),
+                    Cmd::SetFlavor(f) => w.do_set_flavor(f).await,
+                    Cmd::ScanFinished { gen, report } => {
+                        if gen != w.gen {
+                            w.log("scan superseded, result discarded");
+                        } else {
+                            let matched = report.matched.len();
+                            let unmatched = report.unmatched.len();
+                            scan::apply_scan_report(&mut w.store, &report, &w.cfg);
+                            w.save_state();
+                            w.log(format!("scan done: {matched} matched, {unmatched} unmanaged"));
+                            let _ = w.ev.send(Ev::ScanDone { matched, unmatched });
+                        }
+                    }
                     Cmd::Check => { w.do_check().await; last_check = now_unix(); }
                     Cmd::ApplyAll => {
                         let updates = w.do_check().await;
