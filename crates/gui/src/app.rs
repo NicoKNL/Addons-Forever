@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc;
 
-use addons_forever_core::config::AppConfig;
+use addons_forever_core::config::{AppConfig, Theme};
 use addons_forever_core::flavor::Flavor;
 use addons_forever_core::store::AddonState;
 use addons_forever_core::types::{Channel, ProviderKind, SearchItem};
@@ -115,6 +115,8 @@ pub struct AppGui {
     pub busy: std::collections::BTreeMap<String, (String, f32)>,
     /// value of [ui] scale currently applied via egui zoom_factor
     pub applied_scale: f32,
+    /// value of [ui] theme currently applied via egui's theme preference
+    pub applied_theme: Option<Theme>,
     /// top bar busy states (set on click, cleared by ScanDone/CheckDone/Failed)
     pub scanning: bool,
     pub checking: bool,
@@ -175,6 +177,7 @@ impl AppGui {
             addon_menu: None,
             busy: Default::default(),
             applied_scale: -1.0,
+            applied_theme: None,
             scanning: false,
             checking: false,
             window_size: None,
@@ -396,7 +399,7 @@ impl AppGui {
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if self.cfg.network.offline {
-                    ui.colored_label(egui::Color32::GOLD, "[offline]");
+                    ui.colored_label(tabs::tone(ui, tabs::Tone::Warn), "[offline]");
                 }
                 let flavor_txt = self.cfg.app.flavor.label().to_string();
                 egui::ComboBox::from_id_salt("flavor")
@@ -463,7 +466,7 @@ impl AppGui {
             }
             if let Some((msg, at)) = self.toast.clone() {
                 if at.elapsed().as_secs() < 8 {
-                    ui.colored_label(egui::Color32::from_rgb(255, 120, 120), format!("! {msg}"));
+                    ui.colored_label(tabs::tone(ui, tabs::Tone::Bad), format!("! {msg}"));
                 } else {
                     self.toast = None;
                 }
@@ -765,6 +768,18 @@ impl AppGui {
         self.applied_scale = self.cfg.ui.scale;
     }
 
+    /// Apply `[ui] theme`. Both egui styles are configured in `setup_style`;
+    /// this only picks which one shows (System follows the OS appearance).
+    pub fn apply_theme(&mut self, ctx: &egui::Context) {
+        let theme = self.cfg.ui.theme;
+        ctx.set_theme(match theme {
+            Theme::System => egui::ThemePreference::System,
+            Theme::Dark => egui::ThemePreference::Dark,
+            Theme::Light => egui::ThemePreference::Light,
+        });
+        self.applied_theme = Some(theme);
+    }
+
     /// Ctrl+= / Ctrl+- live zoom, persisted to the ini.
     pub fn zoom_shortcuts(&mut self, ctx: &egui::Context) {
         let delta = ctx.input_mut(|i| {
@@ -823,6 +838,9 @@ impl eframe::App for AppGui {
         }
         if (self.applied_scale - self.cfg.ui.scale).abs() > 0.001 {
             self.apply_scale(ctx);
+        }
+        if self.applied_theme != Some(self.cfg.ui.theme) {
+            self.apply_theme(ctx);
         }
 
         if let Some(tray) = &self.tray {
