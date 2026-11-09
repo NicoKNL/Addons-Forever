@@ -42,7 +42,13 @@ pub struct AppSection {
     pub game_version: Option<String>,
     /// GitHub `owner/repo` that hosts app releases (self-update), None = default.
     pub update_repo: Option<String>,
+    /// Install app updates automatically when a check finds one.
+    /// Off by default: updates are announced, and installed on user action.
+    pub self_update: bool,
 }
+
+/// Default app-release repository (where the GitHub releases live).
+pub const DEFAULT_UPDATE_REPO: &str = "Yoremto/Addons-Forever";
 
 impl Default for AppSection {
     fn default() -> Self {
@@ -51,7 +57,8 @@ impl Default for AppSection {
             auto_detect: true,
             flavor: Flavor::default(),
             game_version: None,
-            update_repo: None,
+            update_repo: Some(DEFAULT_UPDATE_REPO.to_string()),
+            self_update: false,
         }
     }
 }
@@ -177,6 +184,7 @@ impl AppConfig {
         kv_bool(&mut s, "auto_detect", self.app.auto_detect);
         kv_opt(&mut s, "game_version", self.app.game_version.as_deref());
         kv_opt(&mut s, "update_repo", self.app.update_repo.as_deref());
+        kv_bool(&mut s, "self_update", self.app.self_update);
         s.push('\n');
         s.push_str("[updates]\n");
         kv_bool(&mut s, "auto_update", self.updates.auto_update);
@@ -269,6 +277,7 @@ fn cfg_from_ini(ini: &Ini) -> Result<AppConfig> {
         }
         cfg.app.game_version = s.get("game_version").map(str::to_string);
         cfg.app.update_repo = s.get("update_repo").map(str::to_string);
+        cfg.app.self_update = s.get("self_update").map(|v| parse_bool(v, false)).unwrap_or(cfg.app.self_update);
     }
     if let Some(s) = ini.section(Some("updates")) {
         cfg.updates.auto_update = s.get("auto_update").map(|v| parse_bool(v, true)).unwrap_or(cfg.updates.auto_update);
@@ -446,6 +455,14 @@ mod tests {
         let ini = Ini::load_from_str(&text).unwrap();
         let back = cfg_from_ini(&ini).unwrap();
         assert_eq!(cfg, back);
+
+        // update repo ships a default; auto-install is off by default
+        assert_eq!(AppConfig::default().app.update_repo.as_deref(), Some(DEFAULT_UPDATE_REPO));
+        assert!(!AppConfig::default().app.self_update);
+        let mut cfg2 = AppConfig::default();
+        cfg2.app.self_update = true;
+        let ini2 = Ini::load_from_str(&cfg2.to_ini_text()).unwrap();
+        assert!(cfg_from_ini(&ini2).unwrap().app.self_update);
     }
 
     #[test]

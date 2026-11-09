@@ -42,6 +42,9 @@ pub enum Cmd {
     /// Install by pasting a URL (github repo, curse slug page, mmoui file, zip URL).
     InstallUrl(String),
     SaveConfig(Box<AppConfig>),
+    /// Query the app release feed (no install).
+    CheckAppUpdate,
+    /// Install the app update (swap + restart-on-next-launch).
     SelfUpdate,
 }
 
@@ -65,6 +68,8 @@ pub enum Ev {
         total: u32,
     },
     ChangelogDone { key: String, title: String, text: String },
+    /// A newer app release exists (the update flows live in Settings).
+    SelfUpdateAvailable { version: String },
     /// A just-installed addon declares dependencies that are missing from the
     /// AddOns folder; the GUI offers to install them.
     DepsFound { addon: String, deps: Vec<DepStatus> },
@@ -625,6 +630,73 @@ impl Worker {
         self.emit_state();
     }
 
+    /// Query the app release feed. On startup (`manual == false`) a found
+    /// update only announces; with `[app] self_update = true` it installs.
+    async fn do_check_app_update(&mut self, manual: bool) {
+        let Some(repo) = self.update_repo() else {
+            if manual {
+                let _ = self.ev.send(Ev::SelfUpdateDone {
+                    info: "app self-update is not configured. Set `update_repo = owner/repo` under [app] in the .ini (GitHub Releases)".into(),
+                });
+            }
+            return;
+        };
+        if self.cfg.network.offline {
+            if manual {
+                let _ = self.ev.send(Ev::SelfUpdateDone { info: "offline mode: no update check performed".into() });
+            }
+            return;
+        }
+        let ctx = self.ctx.clone();
+        let ev = self.ev.clone();
+        let auto = self.cfg.app.self_update;
+        match crate::selfupdate::check(&ctx, &repo).await {
+            Ok(Some(version)) => {
+                self.log(format!("app update available: {}", version));
+                let _ = ev.send(Ev::SelfUpdateAvailable { version: version.clone() });
+                if auto {
+                    if cfg!(windows) {
+                        let r = repo.clone();
+                        let out = tokio::task::spawn_blocking(move || crate::selfupdate::run(&r)).await;
+                        let info = match out {
+                            Ok(Ok(msg)) => msg,
+                            Ok(Err(e)) => format!("app update failed: {e}"),
+                            Err(e) => format!("app update job panicked: {e}"),
+                        };
+                        self.log(info.clone());
+                        let _ = ev.send(Ev::SelfUpdateDone { info });
+                    } else {
+                        let info = format!("app update {version} available; self-install is a Windows feature, see Settings");
+                        self.log(info.clone());
+                        let _ = ev.send(Ev::SelfUpdateDone { info });
+                    }
+                }
+            }
+            Ok(None) => {
+                if manual {
+                    let _ = ev.send(Ev::SelfUpdateDone {
+                        info: format!("App is up to date ({}).", env!("CARGO_PKG_VERSION")),
+                    });
+                }
+            }
+            Err(e) => {
+                self.log(format!("app update check failed: {e}"));
+                if manual {
+                    let _ = ev.send(Ev::SelfUpdateDone { info: format!("app update check failed: {e}") });
+                }
+            }
+        }
+    }
+
+    fn update_repo(&self) -> Option<String> {
+        self.cfg
+            .app
+            .update_repo
+            .clone()
+            .map(|r| r.trim().to_string())
+            .filter(|r| !r.is_empty())
+    }
+
     fn do_self_update(&mut self) {
         let ev = self.ev.clone();
         let Some(repo) = self
@@ -707,6 +779,7 @@ async fn run(
     } else {
         w.log("AddOns folder not configured. Open Settings.");
     }
+    w.do_check_app_update(false).await;
 
     let mut last_check: i64 = 0;
     let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
@@ -789,6 +862,7 @@ async fn run(
                         let path = AppConfig::config_path(&w.data_dir);
                         w.do_save_config(*new_cfg, &path);
                     }
+                    Cmd::CheckAppUpdate => w.do_check_app_update(true).await,
                     Cmd::SelfUpdate => w.do_self_update(),
                 }
             }

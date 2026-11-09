@@ -106,6 +106,8 @@ pub struct AppGui {
     pub settings_form: Option<Box<AppConfig>>,
     pub settings_msg: Option<String>,
     pub self_update_info: Option<String>,
+    /// Latest app version known to be available (drives title + Settings badge).
+    pub self_update_available: Option<String>,
     pub last_check: Option<i64>,
     pub quit: bool,
     pub addon_menu: Option<String>,
@@ -118,6 +120,8 @@ pub struct AppGui {
     pub checking: bool,
     pub window_size: Option<egui::Vec2>,
     size_save: u32,
+    /// last title string applied to the OS window (change-detect for badge text)
+    window_title: String,
 
     pub tray: Option<crate::tray::TrayCtl>,
 }
@@ -160,6 +164,8 @@ impl AppGui {
             settings_form: None,
             settings_msg: None,
             self_update_info: None,
+            self_update_available: None,
+            window_title: "Addons Forever".into(),
             last_check: None,
             quit: false,
             addon_menu: None,
@@ -321,7 +327,12 @@ impl AppGui {
             }
             Ev::SelfUpdateDone { info } => {
                 self.self_update_info = Some(info.clone());
+                self.self_update_available = None;
                 self.push_log(format!("self-update: {info}"));
+            }
+            Ev::SelfUpdateAvailable { version } => {
+                self.self_update_available = Some(version.clone());
+                self.push_log(format!("app update available: {version} (see Settings)"));
             }
         }
     }
@@ -445,10 +456,11 @@ impl AppGui {
     }
 
     pub fn tab_bar(&mut self, ui: &mut egui::Ui) {
+        let badge = if self.self_update_available.is_some() { "Settings (1)" } else { "Settings" };
         ui.horizontal(|ui| {
             ui.selectable_value(&mut self.tab, Tab::Addons, "My Addons");
             ui.selectable_value(&mut self.tab, Tab::Discover, "Discover");
-            ui.selectable_value(&mut self.tab, Tab::Settings, "Settings");
+            ui.selectable_value(&mut self.tab, Tab::Settings, badge);
             ui.selectable_value(&mut self.tab, Tab::Log, "Log");
         });
     }
@@ -785,6 +797,14 @@ impl eframe::App for AppGui {
     /// Runs before every UI pass, and also while the window is hidden (tray).
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_events(ctx);
+        let want_title = match &self.self_update_available {
+            Some(v) => format!("Addons Forever  (update {v} available)"),
+            None => "Addons Forever".into(),
+        };
+        if want_title != self.window_title {
+            self.window_title = want_title.clone();
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(want_title));
+        }
         if (self.applied_scale - self.cfg.ui.scale).abs() > 0.001 {
             self.apply_scale(ctx);
         }

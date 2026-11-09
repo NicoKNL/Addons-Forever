@@ -28,8 +28,14 @@ your IP address. That is the full extent of what anyone learns. The app sends a
 static `User-Agent` (`addons-forever/<version>`) with no machine identifier, path,
 locale, or anything unique. The app has no client id.
 
-The one background request is the optional, opt-in check for a new version of the
-app itself on GitHub Releases. It is off until you set `update_repo` in the config.
+The one background request is the check for a new version of the app itself on
+GitHub Releases, sent once at startup to `api.github.com` for the configured
+`update_repo` (default: this project's releases). It discovers a new version
+only: nothing downloads and nothing is installed unless you press the update
+button, and enabling automatic installs is your choice in Settings. Turn the
+whole check off by clearing `update_repo` in the config, setting `[network]
+offline = true`, or any ad block: it is one plain API call to GitHub, and GitHub
+logs it like any request, including your IP address.
 
 ## What is stored, and where
 

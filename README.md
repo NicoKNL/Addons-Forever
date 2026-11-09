@@ -10,11 +10,12 @@ with [egui](https://github.com/emilk/egui).
 - **Fast.** Startup, scan and update checks finish in about a second.
 - **Clean.** Native widgets, keyboard friendly, no webview.
 - **Easy.** Point the app at your AddOns folder, press Scan, done.
-- **Private.** No telemetry, no analytics, no accounts, no background traffic. The app
-  contacts addon providers (CurseForge, GitHub, Tukui, WoWInterface, Wago) when it
-  fetches addons for you. Their servers log those requests the same way any web
-  download is logged, and that is all they ever see. Details in
-  [PRIVACY.md](PRIVACY.md).
+- **Private.** No telemetry, no analytics, no accounts. The app contacts addon
+  providers (CurseForge, GitHub, Tukui, WoWInterface, Wago) when it fetches addons
+  for you, and checks GitHub Releases once at startup for a newer app version
+  (it only reports it to you; nothing downloads until you say so). Their servers
+  log those requests the same way any web download is logged, and that is all
+  they ever see. Details in [PRIVACY.md](PRIVACY.md).
 
 ## Features
 

@@ -109,12 +109,15 @@ pub fn addons_tab(app: &mut AppGui, ui: &mut egui::Ui) {
         .resizable(true)
         .id_salt("addons-table")
         .column(Column::initial(74.0).at_least(74.0))
-        .column(Column::remainder().at_least(150.0))
+        .column(Column::initial(260.0).at_least(150.0))
         .column(Column::initial(78.0))
         .column(Column::initial(84.0))
         .column(Column::initial(64.0))
         .column(Column::initial(70.0))
-        .column(Column::initial(280.0).at_least(280.0))
+            .column(Column::initial(280.0).at_least(280.0))
+        // trailing filler: the table always spans the full window width, so
+        // extra space lands at the row end, not as gaps inside the columns
+        .column(Column::remainder())
         .header(22.0, |mut h| {
             h.col(|ui| {
                 let all_on = !rows.is_empty() && rows.iter().all(|a| a.auto_update);
@@ -154,6 +157,7 @@ pub fn addons_tab(app: &mut AppGui, ui: &mut egui::Ui) {
                 resize_strip(ui);
             });
             h.col(|ui| { ui.weak("Actions"); });
+            h.col(|_ui| {});
         })
         .body(|body| {
             body.rows(32.0, rows.len(), |mut row| {
@@ -252,6 +256,7 @@ pub fn addons_tab(app: &mut AppGui, ui: &mut egui::Ui) {
                         }
                     });
                 });
+                row.col(|_ui| {});
             });
         });
 
@@ -471,6 +476,7 @@ pub fn discover_tab(app: &mut AppGui, ui: &mut egui::Ui) {
             .column(Column::initial(78.0))
             .column(Column::initial(80.0))
             .column(Column::initial(110.0))
+            .column(Column::remainder())
             .header(22.0, |mut h| {
                 h.col(|ui| {
                     if header_cell(ui, dcol, dasc, 0, "Addon").clicked() {
@@ -499,6 +505,7 @@ pub fn discover_tab(app: &mut AppGui, ui: &mut egui::Ui) {
                     resize_strip(ui);
                 });
                 h.col(|ui| { ui.weak("Install"); });
+                h.col(|_ui| {});
             })
             .body(|body| {
                 body.rows(34.0, items.len(), |mut row| {
@@ -556,6 +563,7 @@ pub fn discover_tab(app: &mut AppGui, ui: &mut egui::Ui) {
                             });
                         }
                     });
+                    row.col(|_ui| {});
                 });
             });
         }
@@ -584,6 +592,7 @@ pub fn settings_tab(app: &mut AppGui, ui: &mut egui::Ui) {
     let data_dir = app.data_dir.clone();
     let update_repo = app.update_repo().unwrap_or_else(|| "not configured - set [app] update_repo".into());
     let self_update_info = app.self_update_info.clone();
+    let app_update_available = app.self_update_available.clone();
     let mut cmds: Vec<Cmd> = Vec::new();
     let mut save_msg: Option<String> = None;
     let mut save_form: Option<AppConfig> = None;
@@ -720,10 +729,29 @@ pub fn settings_tab(app: &mut AppGui, ui: &mut egui::Ui) {
 
         ui.group(|ui| {
             ui.heading("App");
-            ui.label(format!("Version {app_version}  -  app updates from {update_repo} (GitHub, opt-in check only)"));
-            if cfg!(windows) && ui.button("Check for app updates").clicked() {
-                cmds.push(Cmd::SelfUpdate);
-            }
+            ui.label(format!("Version {app_version}  -  app updates from {update_repo}"));
+            let mut cmds2: Vec<Cmd> = Vec::new();
+            ui.horizontal(|ui| {
+                if ui.button("Check for app updates").clicked() {
+                    cmds2.push(Cmd::CheckAppUpdate);
+                }
+                if let Some(v) = &app_update_available {
+                    ui.label(
+                        egui::RichText::new(format!("Update available: {v}"))
+                            .strong()
+                            .color(ui.visuals().hyperlink_color),
+                    );
+                    if ui.button("Install update").clicked() {
+                        cmds2.push(Cmd::SelfUpdate);
+                    }
+                }
+            });
+            cmds.extend(cmds2);
+            ui.checkbox(
+                &mut form.app.self_update,
+                "Install app updates automatically (checked on startup)",
+            )
+            .on_hover_text("Off by default: updates are announced in the window title and here.");
             if let Some(info) = &self_update_info {
                 ui.label(egui::RichText::new(info).small());
             }
@@ -736,7 +764,8 @@ pub fn settings_tab(app: &mut AppGui, ui: &mut egui::Ui) {
                 }
             });
             ui.label(egui::RichText::new(
-                "Everything the app knows lives in this folder: addons-forever.ini, state.json, logs/. Nothing is uploaded anywhere.",
+                "Everything the app knows lives in this folder: addons-forever.ini and the managed addons \
+                 themselves. No state files, no logs on disk, nothing uploaded anywhere.",
             )
             .small()
             .weak());
