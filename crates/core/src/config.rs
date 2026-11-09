@@ -204,7 +204,11 @@ impl AppConfig {
             cfg.save(path)?;
             return Ok(cfg);
         }
-        let ini = Ini::load_from_file(path)
+        // Parse with `\` kept raw. With escape processing (the rust-ini
+        // default) a Windows value like `C:\World of Warcraft\Interface\AddOns`
+        // collapses to `C:World of WarcraftInterfaceAddOns`, silently losing
+        // the configured path. load_from_file_* also strips a UTF-8 BOM.
+        let ini = Ini::load_from_file_noescape(path)
             .map_err(|e| Error::Config(format!("{}: {e}", path.display())))?;
         cfg_from_ini(&ini)
     }
@@ -507,7 +511,7 @@ mod tests {
             },
         );
         let text = cfg.to_ini_text();
-        let ini = Ini::load_from_str(&text).unwrap();
+        let ini = Ini::load_from_str_noescape(&text).unwrap();
         let back = cfg_from_ini(&ini).unwrap();
         assert_eq!(cfg, back);
 
@@ -516,7 +520,7 @@ mod tests {
         assert!(!AppConfig::default().app.self_update);
         let mut cfg2 = AppConfig::default();
         cfg2.app.self_update = true;
-        let ini2 = Ini::load_from_str(&cfg2.to_ini_text()).unwrap();
+        let ini2 = Ini::load_from_str_noescape(&cfg2.to_ini_text()).unwrap();
         assert!(cfg_from_ini(&ini2).unwrap().app.self_update);
     }
 
@@ -529,6 +533,58 @@ mod tests {
         let cfg = AppConfig::load(&p).unwrap();
         assert!(p.exists());
         assert_eq!(cfg.app.flavor, Flavor::Forever);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Regression: a Windows `addons_dir` must survive the ini roundtrip.
+    /// rust-ini's default escape processing collapsed
+    /// `C:\World of Warcraft\Interface\AddOns` to
+    /// `C:World of WarcraftInterfaceAddOns`, so scans after a restart reported
+    /// "no AddOns directory configured" (0.3.4 Windows bug report).
+    #[test]
+    fn load_windows_addons_dir_backslashes_and_bom() {
+        let dir = std::env::temp_dir().join(format!("fa-cfg-win-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = AppConfig::config_path(&dir);
+        let win_path = r"C:\World of Warcraft\Interface\AddOns";
+        // UTF-8 BOM first: Notepad's "UTF-8" files carry one; load must cope.
+        std::fs::write(
+            &p,
+            format!("\u{feff}[app]\nflavor = forever\naddons_dir = {win_path}\nauto_detect = false\n"),
+        )
+        .unwrap();
+        let cfg = AppConfig::load(&p).unwrap();
+        assert_eq!(cfg.app.addons_dir.as_deref(), Some(win_path));
+        // the path parses intact; on this machine it is not a directory, so
+        // the effective dir is None (auto-detect off)
+        assert_eq!(cfg.addons_dir(), None);
+
+        // full production roundtrip: save writes the path raw, load reads it back
+        let mut cfg2 = AppConfig::default();
+        cfg2.app.addons_dir = Some(win_path.into());
+        cfg2.save(&p).unwrap();
+        let cfg3 = AppConfig::load(&p).unwrap();
+        assert_eq!(cfg3.app.addons_dir.as_deref(), Some(win_path));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A quoted path (common Windows ini habit) parses to the bare path when
+    /// quote handling stays enabled and escapes stay off.
+    #[test]
+    fn load_quoted_addons_dir() {
+        let dir = std::env::temp_dir().join(format!("fa-cfg-q-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = AppConfig::config_path(&dir);
+        std::fs::write(
+            &p,
+            "[app]\naddons_dir = \"C:\\World of Warcraft\\Interface\\AddOns\"\nauto_detect = false\n",
+        )
+        .unwrap();
+        let cfg = AppConfig::load(&p).unwrap();
+        assert_eq!(
+            cfg.app.addons_dir.as_deref(),
+            Some(r"C:\World of Warcraft\Interface\AddOns")
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

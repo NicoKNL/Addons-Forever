@@ -285,7 +285,20 @@ impl Worker {
 
     async fn do_scan(&mut self) {
         let Some(dir) = self.addons_dir() else {
-            self.log("scan: no AddOns directory configured");
+            let set = self
+                .cfg
+                .app
+                .addons_dir
+                .as_deref()
+                .map(|p| p.trim().to_string())
+                .filter(|p| !p.is_empty());
+            match set {
+                Some(p) => self.log(format!(
+                    "scan: configured AddOns directory not found: {p} (check [app] addons_dir in the ini; auto-detection is {})",
+                    if self.cfg.app.auto_detect { "on (found nothing)" } else { "off" }
+                )),
+                None => self.log("scan: no AddOns directory configured"),
+            }
             let _ = self.ev.send(Ev::ScanDone { matched: 0, unmatched: 0 });
             return;
         };
