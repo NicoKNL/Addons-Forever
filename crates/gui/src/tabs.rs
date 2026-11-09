@@ -104,27 +104,52 @@ pub fn addons_tab(app: &mut AppGui, ui: &mut egui::Ui) {
     // the header cells draw their own short resize affordance (resize_strip).
     ui.visuals_mut().widgets.noninteractive.bg_stroke = egui::Stroke::NONE;
     ui.visuals_mut().widgets.hovered.bg_stroke = egui::Stroke::NONE;
-    // Proportional layout: every column grows and shrinks with the window,
-    // the table spans the full panel width at every size. Base widths are
-    // ratios edited by the header boundary drags.
-    const ADDONS_COLS_MIN: [f32; 7] = [74.0, 150.0, 60.0, 64.0, 48.0, 56.0, 245.0];
+    // Proportional layout with content floors: every column shows its text
+    // unwrapped and un-truncated when the window allows, columns grow and
+    // shrink with the window, and the table spans the full panel width.
+    // The Auto column is a fixed-width control column.
+    const AUTO_W: f32 = 74.0;
+    const ACTIONS_W: f32 = 305.0;
+    // floors (col 1..6): below these, labels start truncating
+    const ADDONS_MIN: [f32; 6] = [120.0, 64.0, 64.0, 48.0, 56.0, ACTIONS_W];
     if app.addons_cols.is_empty() {
-        app.addons_cols = vec![74.0, 260.0, 78.0, 84.0, 64.0, 70.0, 280.0];
+        app.addons_cols = vec![260.0, 78.0, 84.0, 64.0, 70.0, ACTIONS_W];
     }
+    // content floor per column: widest visible label (cells use .small(),
+    // headers the body font; + cell padding)
+    let pad = CELL_PAD;
+    let mut content: [f32; 6] = [120.0, 64.0, 64.0, 48.0, 56.0, ACTIONS_W];    for (slot, label) in content.iter_mut().zip(["Addon", "Installed", "Available", "Size", "Source", "Actions"]) {
+        *slot = (*slot).max(est_text_w(ui, label, false, false) + pad);
+    }
+    for a in &rows {
+        content[0] = content[0].max(est_text_w(ui, &a.name, false, true) + pad);
+        content[1] = content[1].max(est_text_w(ui, a.installed_version.as_deref().unwrap_or("-"), true, false) + pad);
+        let avail_v = a
+            .pending_update
+            .as_ref()
+            .map(|p| p.version.clone())
+            .or_else(|| a.cached_remote.as_ref().and_then(|m| m.files.first()).map(|f| f.version.clone()))
+            .unwrap_or_default();
+        content[2] = content[2].max(est_text_w(ui, &avail_v, true, true) + pad);
+        content[3] = content[3].max(est_text_w(ui, &fmt_size(a.size_bytes), true, false) + pad);
+        content[4] = content[4].max(est_text_w(ui, a.provider.label(), true, false) + pad);
+    }
+
     let spacing = ui.spacing().item_spacing.x;
-    let (w, wscale) = fit_widths(&app.addons_cols, &ADDONS_COLS_MIN, ui.available_width(), spacing);
+    let table_avail = ui.available_width() - AUTO_W - spacing;
+    let (w, wscale) = fit_widths(&app.addons_cols, &content, &ADDONS_MIN, table_avail, spacing);
     let mut drag = [0.0f32; 6];
 
     TableBuilder::new(ui)
         .striped(true)
         .id_salt("addons-table")
+        .column(Column::exact(AUTO_W))
         .column(Column::exact(w[0]))
         .column(Column::exact(w[1]))
         .column(Column::exact(w[2]))
         .column(Column::exact(w[3]))
         .column(Column::exact(w[4]))
         .column(Column::exact(w[5]))
-        .column(Column::exact(w[6]))
         .header(22.0, |mut h| {
             h.col(|ui| {
                 let all_on = !rows.is_empty() && rows.iter().all(|a| a.auto_update);
@@ -205,7 +230,7 @@ pub fn addons_tab(app: &mut AppGui, ui: &mut egui::Ui) {
                     }
                     if !sub.is_empty() {
                         let sub = cap_chars(&sub, 96);
-                        ui.add(egui::Label::new(egui::RichText::new(sub).small().weak()).wrap().selectable(false));
+                        ui.add(egui::Label::new(egui::RichText::new(sub).small().weak()).truncate().selectable(false));
                     }
                 });
 
@@ -217,7 +242,10 @@ pub fn addons_tab(app: &mut AppGui, ui: &mut egui::Ui) {
                 row.col(|ui| {
                     if has_update {
                         let v = a.pending_update.as_ref().map(|p| p.version.clone()).unwrap_or_default();
-                        ui.add(egui::Label::new(egui::RichText::new(v).color(egui::Color32::from_rgb(140, 230, 140)).small().strong()));
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(v).color(egui::Color32::from_rgb(140, 230, 140)).small().strong())
+                                .truncate(),
+                        );
                     } else {
                         let latest = a
                             .cached_remote
@@ -225,17 +253,17 @@ pub fn addons_tab(app: &mut AppGui, ui: &mut egui::Ui) {
                             .and_then(|m| m.files.first())
                             .map(|f| f.version.clone())
                             .unwrap_or_default();
-                        ui.add(egui::Label::new(egui::RichText::new(latest).weak().small()));
+                        ui.add(egui::Label::new(egui::RichText::new(latest).weak().small()).truncate());
                     }
                 });
 
                 row.col(|ui| {
                     let sz = fmt_size(a.size_bytes);
-                    ui.add(egui::Label::new(egui::RichText::new(sz).small().weak()).selectable(false));
+                    ui.add(egui::Label::new(egui::RichText::new(sz).small().weak()).truncate().selectable(false));
                 });
 
                 row.col(|ui| {
-                    ui.add(egui::Label::new(egui::RichText::new(a.provider.label()).small().weak()).selectable(false));
+                    ui.add(egui::Label::new(egui::RichText::new(a.provider.label()).small().weak()).truncate().selectable(false));
                 });
 
                 row.col(|ui| {
@@ -279,8 +307,15 @@ pub fn addons_tab(app: &mut AppGui, ui: &mut egui::Ui) {
         });
 
     for (i, &dx) in drag.iter().enumerate() {
-        if dx != 0.0 {
-            apply_boundary_drag(&mut app.addons_cols, &ADDONS_COLS_MIN, wscale, i, dx);
+        if dx == 0.0 || wscale <= 0.0 {
+            continue;
+        }
+        if i == 0 {
+            // boundary against the fixed Auto column: only the Addon column changes
+            let floor = ADDONS_MIN[0] / wscale;
+            app.addons_cols[0] = (app.addons_cols[0] + dx / wscale).max(floor);
+        } else {
+            apply_boundary_drag(&mut app.addons_cols, &ADDONS_MIN, wscale, i - 1, dx);
         }
     }
 
@@ -330,19 +365,55 @@ fn resize_strip(ui: &mut egui::Ui) -> Option<f32> {
     }
 }
 
-/// Column widths that fill `avail` (inclusive of inter-column spacing) in
-/// proportion to `base`, each column at least its `min`. The table edges
-/// always sit at the panel edges; every column grows and shrinks with the
-/// window. Returns the widths and the px-per-base-unit scale.
-fn fit_widths(base: &[f32], min: &[f32], avail: f32, spacing: f32) -> (Vec<f32>, f32) {
-    let n = base.len().max(1);
-    let inner = (avail - spacing * (n - 1) as f32).max(60.0 * n as f32);
-    let sum: f32 = base.iter().sum::<f32>().max(1.0);
-    let scale = inner / sum;
-    let mut w: Vec<f32> = base.iter().map(|b| b * scale).collect();
-    for (i, m) in min.iter().enumerate().take(n) {
-        w[i] = w[i].max(*m);
+/// Width of `text` rendered in the table's cell fonts, used to measure the
+/// content floor of each column.
+fn est_text_w(ui: &egui::Ui, text: &str, small: bool, strong: bool) -> f32 {
+    let style = if small { egui::TextStyle::Small } else { egui::TextStyle::Body };
+    let font_id = style.resolve(ui.style());
+    let w = ui.painter().layout_no_wrap(text.to_string(), font_id, egui::Color32::PLACEHOLDER).rect.width();
+    if strong {
+        w * 1.06
+    } else {
+        w
     }
+}
+
+/// Cell padding budget around measured text (cell margins + a little slack).
+const CELL_PAD: f32 = 14.0;
+
+/// Column widths for `avail` (inclusive of spacing): each column's display
+/// width is at least its measured content width (nothing valuable is
+/// truncated) and grows proportionally to `base` when the window has slack.
+/// When the window is too narrow for content widths, the slack over content
+/// is given up first, and only then do content columns compress toward their
+/// `min` floors. Returns widths and the px-per-base scale for drag mapping.
+fn fit_widths(base: &[f32], content: &[f32], min: &[f32], avail: f32, spacing: f32) -> (Vec<f32>, f32) {
+    let n = base.len().max(1);
+    let inner = (avail - spacing * (n - 1) as f32).max(40.0 * n as f32);
+    let want: Vec<f32> = base.iter().zip(content).map(|(b, c)| b.max(*c)).collect();
+    let sum_want: f32 = want.iter().sum::<f32>().max(1.0);
+    let sum_base: f32 = base.iter().sum::<f32>().max(1.0);
+    let scale = inner / sum_base;
+    let deficit = sum_want - inner;
+    let w = if deficit <= 0.0 {
+        want.iter().map(|x| x * inner / sum_want).collect()
+    } else {
+        // slack first: shrink above the content floor, proportionally
+        let slack: Vec<f32> = want.iter().zip(content).map(|(w, c)| (w - c).max(0.0)).collect();
+        let sum_slack: f32 = slack.iter().sum();
+        if sum_slack > deficit {
+            want.iter().zip(&slack).map(|(w, s)| w - deficit * s / sum_slack).collect()
+        } else {
+            // then compress content toward the hard minimum, proportionally
+            let room: Vec<f32> =
+                want.iter().zip(min).map(|(w, m)| (w.max(*m) - m).max(0.0)).collect();
+            let sum_room: f32 = room.iter().sum::<f32>().max(1.0);
+            let extra = deficit - sum_slack;
+            want.iter().zip(&room).zip(min)
+                .map(|((w, r), m)| (w - extra * r / sum_room).max(*m))
+                .collect()
+        }
+    };
     (w, scale)
 }
 
@@ -532,12 +603,26 @@ pub fn discover_tab(app: &mut AppGui, ui: &mut egui::Ui) {
             });
         }
         if !items.is_empty() || d.searching {
-        const DISCOVER_COLS_MIN: [f32; 6] = [200.0, 80.0, 52.0, 62.0, 60.0, 104.0];
+        const DISCOVER_INSTALL_W: f32 = 110.0;
+        const DISCOVER_MIN: [f32; 5] = [150.0, 80.0, 52.0, 62.0, 60.0];
         if app.discover_cols.is_empty() {
-            app.discover_cols = vec![360.0, 120.0, 70.0, 78.0, 80.0, 110.0];
+            app.discover_cols = vec![360.0, 120.0, 70.0, 78.0, 80.0];
+        }
+        let pad = CELL_PAD;
+        let mut content: [f32; 5] = [150.0, 80.0, 52.0, 62.0, 60.0];
+        for (slot, label) in content.iter_mut().zip(["Addon", "Author", "Size", "Downloads", "Updated"]) {
+            *slot = (*slot).max(est_text_w(ui, label, false, false) + pad);
+        }
+        for it in items.iter() {
+            content[0] = content[0].max(est_text_w(ui, &it.name, false, true) + pad);
+            content[1] = content[1].max(est_text_w(ui, it.author.as_deref().unwrap_or(""), true, false) + pad);
+            content[2] = content[2].max(est_text_w(ui, &fmt_size(it.size.unwrap_or(0)), true, false) + pad);
+            content[3] = content[3].max(est_text_w(ui, &it.downloads.map(fmt_count).unwrap_or_default(), true, false) + pad);
+            content[4] = content[4].max(est_text_w(ui, &it.updated_at.map(fmt_date).unwrap_or_default(), true, false) + pad);
         }
         let spacing = ui.spacing().item_spacing.x;
-        let (dw, dscale) = fit_widths(&app.discover_cols, &DISCOVER_COLS_MIN, ui.available_width(), spacing);
+        let table_avail = ui.available_width() - DISCOVER_INSTALL_W - spacing;
+        let (dw, dscale) = fit_widths(&app.discover_cols, &content, &DISCOVER_MIN, table_avail, spacing);
         let mut ddrag = [0.0f32; 5];
         TableBuilder::new(ui)
             .striped(true)
@@ -548,7 +633,7 @@ pub fn discover_tab(app: &mut AppGui, ui: &mut egui::Ui) {
             .column(Column::exact(dw[2]))
             .column(Column::exact(dw[3]))
             .column(Column::exact(dw[4]))
-            .column(Column::exact(dw[5]))
+            .column(Column::exact(DISCOVER_INSTALL_W))
             .header(22.0, |mut h| {
                 h.col(|ui| {
                     if header_cell(ui, dcol, dasc, 0, "Addon").clicked() {
@@ -651,8 +736,15 @@ pub fn discover_tab(app: &mut AppGui, ui: &mut egui::Ui) {
                 });
             });
         for (i, &dx) in ddrag.iter().enumerate() {
-            if dx != 0.0 {
-                apply_boundary_drag(&mut app.discover_cols, &DISCOVER_COLS_MIN, dscale, i, dx);
+            if dx == 0.0 || dscale <= 0.0 {
+                continue;
+            }
+            if i == DISCOVER_MIN.len() - 1 {
+                // boundary against the fixed Install column: only Updated changes
+                let floor = DISCOVER_MIN[i] / dscale;
+                app.discover_cols[i] = (app.discover_cols[i] + dx / dscale).max(floor);
+            } else {
+                apply_boundary_drag(&mut app.discover_cols, &DISCOVER_MIN, dscale, i, dx);
             }
         }
         }
@@ -998,33 +1090,60 @@ fn fmt_date(ts: i64) -> String {
 mod layout_tests {
     use super::{apply_boundary_drag, fit_widths};
 
+    const SP: f32 = 8.0;
+
+    fn sum(w: &[f32]) -> f32 {
+        w.iter().sum::<f32>() + SP * (w.len() - 1) as f32
+    }
+
     #[test]
     fn widths_fill_the_available_space() {
-        let base = vec![74.0, 260.0, 78.0, 84.0, 64.0, 70.0, 280.0];
-        let min = vec![40.0; 7];
-        let spacing = 8.0;
+        let base = vec![260.0, 78.0, 84.0, 64.0, 70.0, 280.0];
+        let content = vec![120.0, 64.0, 64.0, 48.0, 56.0, 280.0];
+        let min = vec![120.0, 64.0, 64.0, 48.0, 56.0, 280.0];
         for avail in [820.0, 1080.0, 1600.0, 2400.0] {
-            let (w, _) = fit_widths(&base, &min, avail, spacing);
-            let sum: f32 = w.iter().sum::<f32>() + spacing * 6.0;
-            assert!((sum - avail).abs() < 0.5, "avail {avail} -> sum {sum}");
-            // proportional: the ratio of two unclamped columns is constant
-            let (wide, _) = fit_widths(&base, &min, 2400.0, spacing);
-            let (narrow, _) = fit_widths(&base, &min, 1080.0, spacing);
-            assert!(
-                (wide[1] / wide[6] - narrow[1] / narrow[6]).abs() < 0.01,
-                "not proportional"
-            );
+            let (w, _) = fit_widths(&base, &content, &min, avail, SP);
+            assert!((sum(&w) - avail).abs() < 0.6, "avail {avail} -> sum {}", sum(&w));
         }
     }
 
     #[test]
-    fn mins_are_respected_at_small_widths() {
-        let base = vec![74.0, 260.0, 78.0, 84.0, 64.0, 70.0, 280.0];
-        let min = vec![74.0, 150.0, 60.0, 64.0, 48.0, 56.0, 245.0];
-        let (w, _) = fit_widths(&base, &min, 700.0, 8.0);
-        for (i, (w, m)) in w.iter().zip(&min).enumerate() {
-            assert!(*w >= *m, "column {i} below min at 700px: {w} < {m}");
-        }
+    fn slack_is_given_up_before_content_is_compressed() {
+        // wide user widths, narrow window: content floors must survive intact
+        let base = vec![600.0, 400.0, 400.0];
+        let content = vec![180.0, 90.0, 90.0];
+        let min = vec![100.0, 60.0, 60.0];
+        let avail = 420.0; // less than base, more than content + spacing
+        let (w, _) = fit_widths(&base, &content, &min, avail, SP);
+        assert!(w[0] >= 180.0, "content column truncated by shrinking: {w:?}");
+        assert!(w[1] >= 90.0 && w[2] >= 90.0, "content column truncated: {w:?}");
+        assert!((sum(&w) - avail).abs() < 0.6);
+    }
+
+    #[test]
+    fn content_columns_compress_toward_mins_when_tiny() {
+        let base = vec![260.0, 90.0, 90.0];
+        let content = vec![260.0, 90.0, 90.0];
+        let min = vec![120.0, 60.0, 60.0];
+        let avail = 300.0; // below content sum (440 + spacing)
+        let (w, _) = fit_widths(&base, &content, &min, avail, SP);
+        assert!(w.iter().zip(&min).all(|(w, m)| *w >= *m), "below min: {w:?}");
+        assert!((sum(&w) - avail).abs() < 0.6);
+        // compression is proportional: the widest column loses the most px
+        assert!(w[0] < 260.0 && w[1] <= 90.0);
+    }
+
+    #[test]
+    fn growth_is_proportional() {
+        let base = vec![260.0, 90.0];
+        let content = vec![100.0, 90.0];
+        let min = vec![100.0, 60.0];
+        let (mid, _) = fit_widths(&base, &content, &min, 600.0, SP);
+        let (big, _) = fit_widths(&base, &content, &min, 1200.0, SP);
+        // with content floors met, both columns scale by ~the window factor
+        let r_mid = mid[0] / (mid[0] + mid[1]);
+        let r_big = big[0] / (big[0] + big[1]);
+        assert!((r_mid - r_big).abs() < 0.05, "not proportional: {r_mid} vs {r_big}");
     }
 
     #[test]
