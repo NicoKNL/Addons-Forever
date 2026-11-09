@@ -104,20 +104,27 @@ pub fn addons_tab(app: &mut AppGui, ui: &mut egui::Ui) {
     // the header cells draw their own short resize affordance (resize_strip).
     ui.visuals_mut().widgets.noninteractive.bg_stroke = egui::Stroke::NONE;
     ui.visuals_mut().widgets.hovered.bg_stroke = egui::Stroke::NONE;
+    // Proportional layout: every column grows and shrinks with the window,
+    // the table spans the full panel width at every size. Base widths are
+    // ratios edited by the header boundary drags.
+    const ADDONS_COLS_MIN: [f32; 7] = [74.0, 150.0, 60.0, 64.0, 48.0, 56.0, 245.0];
+    if app.addons_cols.is_empty() {
+        app.addons_cols = vec![74.0, 260.0, 78.0, 84.0, 64.0, 70.0, 280.0];
+    }
+    let spacing = ui.spacing().item_spacing.x;
+    let (w, wscale) = fit_widths(&app.addons_cols, &ADDONS_COLS_MIN, ui.available_width(), spacing);
+    let mut drag = [0.0f32; 6];
+
     TableBuilder::new(ui)
         .striped(true)
-        .resizable(true)
         .id_salt("addons-table")
-        .column(Column::initial(74.0).at_least(74.0))
-        .column(Column::initial(260.0).at_least(150.0))
-        .column(Column::initial(78.0))
-        .column(Column::initial(84.0))
-        .column(Column::initial(64.0))
-        .column(Column::initial(70.0))
-            .column(Column::initial(280.0).at_least(280.0))
-        // trailing filler: the table always spans the full window width, so
-        // extra space lands at the row end, not as gaps inside the columns
-        .column(Column::remainder())
+        .column(Column::exact(w[0]))
+        .column(Column::exact(w[1]))
+        .column(Column::exact(w[2]))
+        .column(Column::exact(w[3]))
+        .column(Column::exact(w[4]))
+        .column(Column::exact(w[5]))
+        .column(Column::exact(w[6]))
         .header(22.0, |mut h| {
             h.col(|ui| {
                 let all_on = !rows.is_empty() && rows.iter().all(|a| a.auto_update);
@@ -125,39 +132,51 @@ pub fn addons_tab(app: &mut AppGui, ui: &mut egui::Ui) {
                 if ui.checkbox(&mut on, "Auto").on_hover_text("Toggle automatic updates for all addons").changed() {
                     auto_all = Some(on);
                 }
+                if let Some(dx) = resize_strip(ui) {
+                    drag[0] = dx;
+                }
             });
             h.col(|ui| {
                 if header_cell(ui, sort_col, sort_dir, 0, "Addon").clicked() {
                     sort_req = Some(0);
                 }
-                resize_strip(ui);
+                if let Some(dx) = resize_strip(ui) {
+                    drag[1] = dx;
+                }
             });
             h.col(|ui| {
                 if header_cell(ui, sort_col, sort_dir, 1, "Installed").clicked() {
                     sort_req = Some(1);
                 }
-                resize_strip(ui);
+                if let Some(dx) = resize_strip(ui) {
+                    drag[2] = dx;
+                }
             });
             h.col(|ui| {
                 if header_cell(ui, sort_col, sort_dir, 2, "Available").clicked() {
                     sort_req = Some(2);
                 }
-                resize_strip(ui);
+                if let Some(dx) = resize_strip(ui) {
+                    drag[3] = dx;
+                }
             });
             h.col(|ui| {
                 if header_cell(ui, sort_col, sort_dir, 3, "Size").clicked() {
                     sort_req = Some(3);
                 }
-                resize_strip(ui);
+                if let Some(dx) = resize_strip(ui) {
+                    drag[4] = dx;
+                }
             });
             h.col(|ui| {
                 if header_cell(ui, sort_col, sort_dir, 4, "Source").clicked() {
                     sort_req = Some(4);
                 }
-                resize_strip(ui);
+                if let Some(dx) = resize_strip(ui) {
+                    drag[5] = dx;
+                }
             });
             h.col(|ui| { ui.weak("Actions"); });
-            h.col(|_ui| {});
         })
         .body(|body| {
             body.rows(32.0, rows.len(), |mut row| {
@@ -256,9 +275,14 @@ pub fn addons_tab(app: &mut AppGui, ui: &mut egui::Ui) {
                         }
                     });
                 });
-                row.col(|_ui| {});
             });
         });
+
+    for (i, &dx) in drag.iter().enumerate() {
+        if dx != 0.0 {
+            apply_boundary_drag(&mut app.addons_cols, &ADDONS_COLS_MIN, wscale, i, dx);
+        }
+    }
 
     if let Some(on) = auto_all {
         cmds.push(Cmd::SetAutoAll(on));
@@ -285,20 +309,63 @@ pub fn addons_tab(app: &mut AppGui, ui: &mut egui::Ui) {
 /// Short resize affordance drawn inside the header cell's right border while
 /// hovered. The full-column guide lines are hidden; dragging the border itself
 /// (which egui_extras tracks across the table height) resizes the column.
-fn resize_strip(ui: &mut egui::Ui) {
+fn resize_strip(ui: &mut egui::Ui) -> Option<f32> {
     let r = ui.max_rect();
     let x = r.max.x + ui.spacing().item_spacing.x * 0.5;
     let strip = egui::Rect::from_min_max(
         egui::pos2(x - 5.0, r.min.y),
         egui::pos2(x + 5.0, r.max.y),
     );
-    let resp = ui.interact(strip, ui.scope_id().with("hdr-resize-strip"), egui::Sense::hover());
+    let resp = ui.interact(strip, ui.scope_id().with("hdr-resize-strip"), egui::Sense::drag());
     if resp.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeColumn);
         let stroke = egui::Stroke::new(1.0, egui::Color32::from_gray(140));
         ui.painter()
             .line_segment([egui::pos2(x, r.min.y), egui::pos2(x, r.max.y)], stroke);
     }
+    if resp.dragged() {
+        Some(resp.drag_delta().x)
+    } else {
+        None
+    }
+}
+
+/// Column widths that fill `avail` (inclusive of inter-column spacing) in
+/// proportion to `base`, each column at least its `min`. The table edges
+/// always sit at the panel edges; every column grows and shrinks with the
+/// window. Returns the widths and the px-per-base-unit scale.
+fn fit_widths(base: &[f32], min: &[f32], avail: f32, spacing: f32) -> (Vec<f32>, f32) {
+    let n = base.len().max(1);
+    let inner = (avail - spacing * (n - 1) as f32).max(60.0 * n as f32);
+    let sum: f32 = base.iter().sum::<f32>().max(1.0);
+    let scale = inner / sum;
+    let mut w: Vec<f32> = base.iter().map(|b| b * scale).collect();
+    for (i, m) in min.iter().enumerate().take(n) {
+        w[i] = w[i].max(*m);
+    }
+    (w, scale)
+}
+
+/// Move a column boundary by a drag (px): the left column grows, the right
+/// shrinks, clamped so neither goes under its minimum display width.
+fn apply_boundary_drag(base: &mut [f32], min: &[f32], scale: f32, i: usize, dx: f32) {
+    if scale <= 0.0 || i + 1 >= base.len() {
+        return;
+    }
+    let lo = |i: usize| min.get(i).copied().unwrap_or(40.0) / scale;
+    let mut a = base[i] + dx / scale;
+    let mut b = base[i + 1] - dx / scale;
+    if a < lo(i) {
+        b += a - lo(i);
+        a = lo(i);
+    }
+    if b < lo(i + 1) {
+        a += b - lo(i + 1);
+        b = lo(i + 1);
+        a = a.max(lo(i));
+    }
+    base[i] = a;
+    base[i + 1] = b;
 }
 
 /// Header label with a *drawn* sort caret (works with every font).
@@ -465,47 +532,65 @@ pub fn discover_tab(app: &mut AppGui, ui: &mut egui::Ui) {
             });
         }
         if !items.is_empty() || d.searching {
+        const DISCOVER_COLS_MIN: [f32; 6] = [200.0, 80.0, 52.0, 62.0, 60.0, 104.0];
+        if app.discover_cols.is_empty() {
+            app.discover_cols = vec![360.0, 120.0, 70.0, 78.0, 80.0, 110.0];
+        }
+        let spacing = ui.spacing().item_spacing.x;
+        let (dw, dscale) = fit_widths(&app.discover_cols, &DISCOVER_COLS_MIN, ui.available_width(), spacing);
+        let mut ddrag = [0.0f32; 5];
         TableBuilder::new(ui)
             .striped(true)
-            .resizable(true)
             .id_salt("discover-table")
             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-            .column(Column::remainder().at_least(200.0))
-            .column(Column::initial(120.0))
-            .column(Column::initial(70.0))
-            .column(Column::initial(78.0))
-            .column(Column::initial(80.0))
-            .column(Column::initial(110.0))
-            .column(Column::remainder())
+            .column(Column::exact(dw[0]))
+            .column(Column::exact(dw[1]))
+            .column(Column::exact(dw[2]))
+            .column(Column::exact(dw[3]))
+            .column(Column::exact(dw[4]))
+            .column(Column::exact(dw[5]))
             .header(22.0, |mut h| {
                 h.col(|ui| {
                     if header_cell(ui, dcol, dasc, 0, "Addon").clicked() {
                         dsort = Some(0);
+                    }
+                    if let Some(dx) = resize_strip(ui) {
+                        ddrag[0] = dx;
                     }
                 });
                 h.col(|ui| {
                     if header_cell(ui, dcol, dasc, 1, "Author").clicked() {
                         dsort = Some(1);
                     }
+                    if let Some(dx) = resize_strip(ui) {
+                        ddrag[1] = dx;
+                    }
                 });
                 h.col(|ui| {
                     if header_cell(ui, dcol, dasc, 2, "Size").clicked() {
                         dsort = Some(2);
+                    }
+                    if let Some(dx) = resize_strip(ui) {
+                        ddrag[2] = dx;
                     }
                 });
                 h.col(|ui| {
                     if header_cell(ui, dcol, dasc, 3, "Downloads").clicked() {
                         dsort = Some(3);
                     }
+                    if let Some(dx) = resize_strip(ui) {
+                        ddrag[3] = dx;
+                    }
                 });
                 h.col(|ui| {
                     if header_cell(ui, dcol, dasc, 4, "Updated").clicked() {
                         dsort = Some(4);
                     }
-                    resize_strip(ui);
+                    if let Some(dx) = resize_strip(ui) {
+                        ddrag[4] = dx;
+                    }
                 });
                 h.col(|ui| { ui.weak("Install"); });
-                h.col(|_ui| {});
             })
             .body(|body| {
                 body.rows(34.0, items.len(), |mut row| {
@@ -563,9 +648,13 @@ pub fn discover_tab(app: &mut AppGui, ui: &mut egui::Ui) {
                             });
                         }
                     });
-                    row.col(|_ui| {});
                 });
             });
+        for (i, &dx) in ddrag.iter().enumerate() {
+            if dx != 0.0 {
+                apply_boundary_drag(&mut app.discover_cols, &DISCOVER_COLS_MIN, dscale, i, dx);
+            }
+        }
         }
         if let Some(col) = dsort {
             if d.sort_col == col {
@@ -903,4 +992,56 @@ fn fmt_date(ts: i64) -> String {
     chrono::DateTime::from_timestamp(ts, 0)
         .map(|dt| dt.format("%Y-%m-%d").to_string())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::{apply_boundary_drag, fit_widths};
+
+    #[test]
+    fn widths_fill_the_available_space() {
+        let base = vec![74.0, 260.0, 78.0, 84.0, 64.0, 70.0, 280.0];
+        let min = vec![40.0; 7];
+        let spacing = 8.0;
+        for avail in [820.0, 1080.0, 1600.0, 2400.0] {
+            let (w, _) = fit_widths(&base, &min, avail, spacing);
+            let sum: f32 = w.iter().sum::<f32>() + spacing * 6.0;
+            assert!((sum - avail).abs() < 0.5, "avail {avail} -> sum {sum}");
+            // proportional: the ratio of two unclamped columns is constant
+            let (wide, _) = fit_widths(&base, &min, 2400.0, spacing);
+            let (narrow, _) = fit_widths(&base, &min, 1080.0, spacing);
+            assert!(
+                (wide[1] / wide[6] - narrow[1] / narrow[6]).abs() < 0.01,
+                "not proportional"
+            );
+        }
+    }
+
+    #[test]
+    fn mins_are_respected_at_small_widths() {
+        let base = vec![74.0, 260.0, 78.0, 84.0, 64.0, 70.0, 280.0];
+        let min = vec![74.0, 150.0, 60.0, 64.0, 48.0, 56.0, 245.0];
+        let (w, _) = fit_widths(&base, &min, 700.0, 8.0);
+        for (i, (w, m)) in w.iter().zip(&min).enumerate() {
+            assert!(*w >= *m, "column {i} below min at 700px: {w} < {m}");
+        }
+    }
+
+    #[test]
+    fn boundary_drag_moves_the_separator_and_keeps_mins() {
+        let mut base = vec![100.0, 100.0, 100.0];
+        let min = vec![40.0, 40.0, 40.0];
+        // scale 2: display px = base * 2
+        apply_boundary_drag(&mut base, &min, 2.0, 0, 20.0);
+        assert_eq!(base[0], 110.0);
+        assert_eq!(base[1], 90.0);
+        // clamp: column 1 cannot go under its 40px minimum (20 base units)
+        apply_boundary_drag(&mut base, &min, 2.0, 0, 200.0);
+        assert_eq!(base[1], 20.0);
+        assert_eq!(base[0], 180.0); // width conserved: 110 + 90 = 180 + 20
+        // dragging past the neighbor's min stops
+        apply_boundary_drag(&mut base, &min, 2.0, 0, 500.0);
+        assert_eq!(base[1], 20.0);
+        assert_eq!(base[0], 180.0);
+    }
 }

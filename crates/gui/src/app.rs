@@ -120,6 +120,10 @@ pub struct AppGui {
     pub checking: bool,
     pub window_size: Option<egui::Vec2>,
     size_save: u32,
+    /// Proportional column widths (base units) for the addon table.
+    pub addons_cols: Vec<f32>,
+    /// Proportional column widths (base units) for the discover table.
+    pub discover_cols: Vec<f32>,
     /// last title string applied to the OS window (change-detect for badge text)
     window_title: String,
 
@@ -175,6 +179,8 @@ impl AppGui {
             checking: false,
             window_size: None,
             size_save: 0,
+            addons_cols: Vec::new(),
+            discover_cols: Vec::new(),
             tray: None,
         };
         app.push_log(format!("addons-forever {app_version} starting"));
