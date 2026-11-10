@@ -109,6 +109,9 @@ pub struct AppGui {
     /// Latest app version known to be available (drives title + Settings badge).
     pub self_update_available: Option<String>,
     pub last_check: Option<i64>,
+    /// AF-18: true when the last check reached every source online (drives the
+    /// status bar's "up to date"; failures and offline runs never set it)
+    pub check_clean: bool,
     pub quit: bool,
     pub addon_menu: Option<String>,
     /// key -> (phase, fraction 0..1) for addons currently downloading/installing.
@@ -173,6 +176,7 @@ impl AppGui {
             self_update_available: None,
             window_title: "Addons Forever".into(),
             last_check: None,
+            check_clean: false,
             quit: false,
             addon_menu: None,
             busy: Default::default(),
@@ -264,13 +268,24 @@ impl AppGui {
                     frac: Some(done as f32 / total.max(1) as f32),
                 });
             }
-            Ev::CheckDone { updates } => {
+            Ev::CheckDone { updates, failed, offline } => {
                 self.scanning = false;
                 self.checking = false;
                 self.job = None;
                 self.last_check = Some(chrono::Local::now().timestamp());
                 self.updates = updates.iter().map(|u| u.key.clone()).collect();
-                if updates.is_empty() {
+                // AF-18: the status bar's "up to date" only follows a clean
+                // check; a partial/offline one is reported truthfully
+                self.check_clean = !offline && failed.is_empty();
+                if offline {
+                    self.push_log("Check: offline mode, results are cache-only");
+                } else if !failed.is_empty() {
+                    let labels = failed.iter().map(|(p, _)| p.as_str()).collect::<Vec<_>>().join(", ");
+                    self.push_log(format!(
+                        "Check: {} source(s) failed ({labels}); showing cached data",
+                        failed.len()
+                    ));
+                } else if updates.is_empty() {
                     self.push_log("Check: all addons are up to date");
                 } else {
                     self.push_log(format!("Updates available: {}", updates.len()));
@@ -298,6 +313,10 @@ impl AppGui {
                 self.job = None;
                 if !key.is_empty() {
                     self.busy.remove(&key);
+                }
+                if key == "search" {
+                    // AF-26: a failed search must end the operation
+                    self.discover.searching = false;
                 }
                 self.toast = Some((msg.clone(), std::time::Instant::now()));
                 self.push_log(format!("FAILED {key}: {msg}"));
@@ -441,8 +460,11 @@ impl AppGui {
             if upd_n > 0 {
                 ui.add(crate::tabs::art(crate::tabs::ART_BADGE_UPDATE, "bytes://badge-update.png", 16.0, 16.0));
                 ui.strong(format!("{upd_n} update(s)"));
-            } else {
+            } else if self.check_clean && last.is_some() {
                 ui.weak("up to date");
+            } else if last.is_some() {
+                ui.weak("check incomplete")
+                    .on_hover_text("the last update check did not reach every source (or ran offline); see the Log tab");
             }
             ui.separator();
             if let Some(j) = job {
@@ -534,6 +556,7 @@ impl AppGui {
                                         provider: *provider,
                                         external_id: id.clone(),
                                         name: e.name.clone(),
+                                        channel: None,
                                     });
                                 }
                             }

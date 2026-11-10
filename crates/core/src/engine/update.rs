@@ -70,14 +70,17 @@ pub(crate) fn meta_stub_for(state: &AddonState) -> RemoteMeta {
 pub(crate) fn update_needed(state: &AddonState, target: &RemoteFile) -> bool {
     let Some(installed) = state.installed_file_id.as_deref() else {
         // Never installed by us (freshly ingested addon): we only know the TOC
-        // version. Treat an identical published version as up to date.
+        // version. Only offer files that are strictly NEWER: an equal version
+        // is up to date, and an older published version is a downgrade, not
+        // an update (AF-16: a provider lagging behind the user's 2.0 install
+        // must not offer 1.0).
         return state
             .installed_version
             .as_deref()
             // Identity counts as up to date: "1.60.28" matches published
             // "1.60.28-forever" (client suffix carries no ordering info), while
             // "1.0.0c" vs "1.0.0d" (letter suffixes) is a real update.
-            .map(|v| version_cmp(v.trim(), target.version.trim()) != std::cmp::Ordering::Equal)
+            .map(|v| version_cmp(v.trim(), target.version.trim()) == std::cmp::Ordering::Less)
             .unwrap_or(true);
     };
     if installed == target.file_id {
@@ -94,6 +97,24 @@ pub(crate) fn update_needed(state: &AddonState, target: &RemoteFile) -> bool {
     }
 }
 
+/// Result of a check: the updates found plus which provider sources failed,
+/// so the caller never presents cached/failing data as a fresh complete check
+/// (AF-18).
+#[derive(Clone, Debug, Default)]
+pub struct CheckOutcome {
+    pub updates: Vec<UpdateInfo>,
+    /// (provider label, error message) for sources that could not be reached
+    pub failed: Vec<(String, String)>,
+    /// true when the check ran in offline mode (cache only, never "up to date")
+    pub offline: bool,
+}
+
+impl CheckOutcome {
+    pub fn is_clean(&self) -> bool {
+        !self.offline && self.failed.is_empty()
+    }
+}
+
 /// Check for updates with the provider map injected (testable core of
 /// [`check_updates`]).
 pub(crate) async fn check_updates_inner(
@@ -102,9 +123,10 @@ pub(crate) async fn check_updates_inner(
     providers: &BTreeMap<ProviderKind, &dyn crate::types::Provider>,
     sel: &FileSelect,
     on_progress: &mut (dyn FnMut(&str, usize, usize) + Send),
-) -> Result<Vec<UpdateInfo>> {
+) -> Result<CheckOutcome> {
     let now = now_unix();
     let offline = ctx.cfg.network.offline;
+    let mut failed: Vec<(String, String)> = Vec::new();
 
     // group managed addons by provider
     let mut groups: BTreeMap<ProviderKind, Vec<String>> = BTreeMap::new();
@@ -127,7 +149,9 @@ pub(crate) async fn check_updates_inner(
             continue;
         };
         // one batched meta() per provider; offline → cache only
+        let mut fresh = true;
         let metas: Vec<RemoteMeta> = if offline {
+            fresh = false;
             keys.iter().filter_map(|k| store.addons.get(k)?.cached_remote.clone()).collect()
         } else {
             let ids: Vec<String> =
@@ -136,6 +160,8 @@ pub(crate) async fn check_updates_inner(
                 Ok(m) => m,
                 Err(e) => {
                     tracing::warn!(provider = kind.as_str(), "update check meta failed: {e}");
+                    failed.push((kind.label().to_string(), e.to_string()));
+                    fresh = false;
                     keys.iter().filter_map(|k| store.addons.get(k)?.cached_remote.clone()).collect()
                 }
             }
@@ -153,7 +179,11 @@ pub(crate) async fn check_updates_inner(
                 continue; // provider doesn't know it and we have no cache
             };
             state.cached_remote = Some(meta.clone());
-            state.cached_at = Some(now);
+            // AF-18: cache-sourced metadata keeps its original fetch time;
+            // only a fresh remote answer stamps cached_at
+            if fresh {
+                state.cached_at = Some(now);
+            }
             state.last_checked = Some(now);
 
             let sel = FileSelect { channel: state.channel, ..sel.clone() };
@@ -178,7 +208,7 @@ pub(crate) async fn check_updates_inner(
     }
 
     store.last_check = Some(now);
-    Ok(updates)
+    Ok(CheckOutcome { updates, failed, offline })
 }
 
 /// Check every managed addon (batched `meta()` per provider, respecting
@@ -190,7 +220,7 @@ pub async fn check_updates(
     reg: &Registry,
     sel: &FileSelect,
     on_progress: &mut (dyn FnMut(&str, usize, usize) + Send),
-) -> Result<Vec<UpdateInfo>> {
+) -> Result<CheckOutcome> {
     let providers: BTreeMap<ProviderKind, &dyn crate::types::Provider> = [
         ProviderKind::Curse,
         ProviderKind::GitHub,
@@ -551,6 +581,8 @@ mod tests {
         st.installed_file_id = None;
         assert!(update_needed(&st, &file("f2", "1.0.1", 5)), "no install proof → update");
         assert!(!update_needed(&st, &file("f2", "1.0.0", 5)), "ingested addon, same version → up to date");
+        // AF-16: provider lagging behind the user's install is not an update
+        assert!(!update_needed(&st, &file("f0", "0.9.0", 5)), "older version → no update (no install proof)");
         st.installed_file_id = Some("old-file".into());
         // same file id → no update
         assert!(!update_needed(&st, &file("old-file", "9.9.9", 9)), "same file id → up to date");
@@ -625,6 +657,8 @@ mod tests {
         )
         .await
         .unwrap();
+        assert!(updates.is_clean() && updates.failed.is_empty());
+        let updates = updates.updates;
 
         assert_eq!(updates.len(), 1, "only the outdated addon: {updates:?}");
         let u = &updates[0];
@@ -656,10 +690,11 @@ mod tests {
                 .collect();
         // simulate: reset the curse state to outdated so the cache flags it again
         store.get_mut(ProviderKind::Curse, "2382").unwrap().installed_file_id = Some("old-file".into());
-        let updates_off =
+        let outcome_off =
             check_updates_inner(&app_off, &mut store, &providers2, &sel(), &mut |_, _, _| {}).await.unwrap();
-        assert_eq!(updates_off.len(), 1);
-        assert_eq!(updates_off[0].target.file_id, "new", "offline uses cached_remote");
+        assert!(outcome_off.offline && !outcome_off.is_clean(), "offline is never a clean check");
+        assert_eq!(outcome_off.updates.len(), 1);
+        assert_eq!(outcome_off.updates[0].target.file_id, "new", "offline uses cached_remote");
         assert_eq!(calls2.load(Ordering::SeqCst), 0, "offline makes no network meta calls");
     }
 

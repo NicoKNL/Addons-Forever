@@ -448,7 +448,9 @@ async fn gh_send(ctx: &AppCtx, url: &str, accept: &str) -> Result<reqwest::Respo
         .get("x-ratelimit-remaining")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    if remaining == "0" {
+    // AF-27: only treat the quota as an error for non-success responses; a
+    // 200 that consumes the last request is valid data
+    if remaining == "0" && !status.is_success() {
         return Err(rate_limit_error());
     }
     if status.as_u16() == 403 || status.as_u16() == 429 {

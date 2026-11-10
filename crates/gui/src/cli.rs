@@ -51,7 +51,10 @@ async fn dispatch(data_dir: &std::path::Path, config_path: &std::path::Path, cfg
     let reg = Registry::new(&ctx);
     let mut store = StateStore::default();
     let sel = FileSelect::from_cfg(&cfg);
-    let needs_dir = matches!(cmd, "scan" | "check" | "update" | "install" | "uninstall" | "fp" | "import");
+    let needs_dir = matches!(
+        cmd,
+        "scan" | "check" | "update" | "install" | "uninstall" | "fp" | "import" | "list" | "export"
+    );
     let addons_dir = if needs_dir {
         cfg.addons_dir().ok_or("AddOns folder not configured. Run `addons-forever cli set-path <dir>`")?
     } else {
@@ -59,6 +62,16 @@ async fn dispatch(data_dir: &std::path::Path, config_path: &std::path::Path, cfg
     };
     use std::path::PathBuf as PB;
     let _: PB = Default::default();
+
+    // AF-10: every inventory-driven command scans first: a new process starts
+    // with an empty store, so list/check/update/uninstall/export used to run
+    // against nothing and report empty success.
+    if matches!(cmd, "check" | "update" | "uninstall" | "list" | "export") {
+        let report = addons_forever_core::engine::scan::scan_addons(&ctx, &addons_dir, &sel, &mut |_, _, _| {})
+            .await
+            .map_err(|e| e.to_string())?;
+        addons_forever_core::engine::scan::apply_scan_report(&mut store, &report, &cfg);
+    }
 
     match cmd {
         "scan" => {
@@ -100,25 +113,41 @@ async fn dispatch(data_dir: &std::path::Path, config_path: &std::path::Path, cfg
             }
         }
         "check" => {
-            let updates = addons_forever_core::engine::update::check_updates(&ctx, &mut store, &reg, &sel, &mut |_, _, _| {})
+            let outcome = addons_forever_core::engine::update::check_updates(&ctx, &mut store, &reg, &sel, &mut |_, _, _| {})
                 .await
                 .map_err(|e| e.to_string())?;
             persist_flags(data_dir, &store)?;
-            for u in &updates {
+            for u in &outcome.updates {
                 println!("UPDATE {:<28} {} -> {}", truncate(&u.name, 28), u.current.clone().unwrap_or_else(|| "-".into()), u.version);
             }
-            println!("{} update(s)", updates.len());
+            println!("{} update(s)", outcome.updates.len());
+            if outcome.offline {
+                println!("offline: results come from cache only");
+            }
+            if !outcome.failed.is_empty() {
+                for (label, msg) in &outcome.failed {
+                    println!("CHECK-FAILED {label}: {msg}");
+                }
+                return Err(format!("{} update source(s) failed", outcome.failed.len()).into());
+            }
         }
         "update" => {
-            let mut updates = addons_forever_core::engine::update::check_updates(&ctx, &mut store, &reg, &sel, &mut |_, _, _| {})
+            let mut outcome = addons_forever_core::engine::update::check_updates(&ctx, &mut store, &reg, &sel, &mut |_, _, _| {})
                 .await
                 .map_err(|e| e.to_string())?;
+            for (label, msg) in &outcome.failed {
+                println!("CHECK-FAILED {label}: {msg}");
+            }
+            let mut updates = std::mem::take(&mut outcome.updates);
             if args.len() > 1 {
                 let f = args[1].to_lowercase();
                 updates.retain(|u| u.name.to_lowercase().contains(&f) || u.key.to_lowercase().contains(&f));
             }
             if updates.is_empty() {
                 println!("all addons up to date");
+                if !outcome.is_clean() {
+                    return Err("update check did not reach every source".into());
+                }
                 return Ok(());
             }
             let summary = addons_forever_core::engine::update::apply_updates(
@@ -139,8 +168,13 @@ async fn dispatch(data_dir: &std::path::Path, config_path: &std::path::Path, cfg
             eprintln!();
             persist_flags(data_dir, &store)?;
             println!("updated {}", summary.updated);
-            for (k, msg) in summary.failed {
+            let failed_n = summary.failed.len();
+            for (k, msg) in &summary.failed {
                 println!("FAILED {k}: {msg}");
+            }
+            // AF-21: a partially failed batch must not exit 0
+            if failed_n > 0 {
+                return Err(format!("{failed_n} addon(s) failed to update").into());
             }
         }
         "install" => {
@@ -350,6 +384,9 @@ async fn dispatch(data_dir: &std::path::Path, config_path: &std::path::Path, cfg
             if manifest.format != crate::worker::EXPORT_FORMAT {
                 return Err("not an addons-forever export file".into());
             }
+            if manifest.version > 1 {
+                return Err(format!("unsupported manifest version {} (this build reads version 1)", manifest.version).into());
+            }
             let n = manifest.addons.len();
             let mut ok = 0usize;
             for e in manifest.addons {
@@ -365,7 +402,12 @@ async fn dispatch(data_dir: &std::path::Path, config_path: &std::path::Path, cfg
                         .await
                         .map_err(|e| e.to_string())?;
                     let meta = metas.into_iter().next().ok_or("provider returned no data")?;
-                    let file = prov.pick(&meta, &sel).ok_or("no compatible file for this client/channel")?;
+                    // AF-20: pick the artifact under the imported entry's channel
+                    let sel_e = match addons_forever_core::types::Channel::from_key(&e.channel) {
+                        Some(ch) => addons_forever_core::types::FileSelect { channel: ch, ..sel.clone() },
+                        None => sel.clone(),
+                    };
+                    let file = prov.pick(&meta, &sel_e).ok_or("no compatible file for this client/channel")?;
                     let owned = store.folder_owners();
                     let outcome = addons_forever_core::engine::install::install(
                         &ctx, &addons_dir, &meta, &file, &owned, &key, &mut |_| {},
@@ -418,6 +460,10 @@ async fn dispatch(data_dir: &std::path::Path, config_path: &std::path::Path, cfg
             }
             persist_flags(data_dir, &store)?;
             println!("import done: {ok}/{n} addon(s) installed");
+            // AF-21: partial import failure is not success
+            if ok < n {
+                return Err(format!("{} of {n} entr(y/ies) failed", n - ok).into());
+            }
         }
         other => return Err(format!("unknown command `{other}`, try `addons-forever cli help`")),
     }

@@ -743,6 +743,7 @@ pub fn discover_tab(app: &mut AppGui, ui: &mut egui::Ui) {
                                         provider: it.provider,
                                         external_id: it.external_id.clone(),
                                         name: it.name.clone(),
+                                        channel: None,
                                     });
                                 }
                                 if it.site_url.is_some() && ui.small_button("Web").clicked() {

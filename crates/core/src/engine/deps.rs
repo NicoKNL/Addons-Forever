@@ -61,8 +61,11 @@ pub fn declared_dependencies(addons_dir: &Path, folders: &[String]) -> Vec<Decla
                     if dep.is_empty() || dep.eq_ignore_ascii_case("Blizzard") {
                         continue;
                     }
-                    if !out.iter().any(|d| d.name.eq_ignore_ascii_case(dep)) {
-                        out.push(DeclaredDep { name: dep.to_string(), required });
+                    // dedup case-insensitively; a later required declaration
+                    // upgrades an earlier optional one
+                    match out.iter_mut().find(|d| d.name.eq_ignore_ascii_case(dep)) {
+                        Some(existing) => existing.required |= required,
+                        None => out.push(DeclaredDep { name: dep.to_string(), required }),
                     }
                 }
             }

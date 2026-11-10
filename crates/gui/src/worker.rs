@@ -29,7 +29,7 @@ pub enum Cmd {
     /// Re-install/update a known addon.
     InstallExisting(String),
     /// Fresh install of a searched addon.
-    InstallNew { provider: ProviderKind, external_id: String, name: String },
+    InstallNew { provider: ProviderKind, external_id: String, name: String, channel: Option<Channel> },
     Uninstall(String),
     Search { provider: ProviderKind, query: String, page: u32 },
     Changelog { key: String },
@@ -60,7 +60,7 @@ pub enum Ev {
     ScanProgress { folder: String, done: usize, total: usize },
     ScanDone { matched: usize, unmatched: usize },
     CheckProgress { name: String, done: usize, total: usize },
-    CheckDone { updates: Vec<UpdateInfo> },
+    CheckDone { updates: Vec<UpdateInfo>, failed: Vec<(String, String)>, offline: bool },
     InstallProgress { key: String, name: String, phase: String, bytes: u64, total: Option<u64> },
     InstallDone { key: String, name: String, version: Option<String> },
     Failed { key: String, msg: String },
@@ -332,11 +332,11 @@ impl Worker {
         }
     }
 
-    async fn do_check(&mut self) -> Vec<UpdateInfo> {
+    async fn do_check(&mut self) -> update::CheckOutcome {
         let reg = Registry::new(&self.ctx);
         let sel = self.sel(self.cfg.updates.channel);
         let ev = self.ev.clone();
-        let updates = match update::check_updates(
+        let outcome = match update::check_updates(
             &self.ctx,
             &mut self.store,
             &reg,
@@ -347,19 +347,30 @@ impl Worker {
         )
         .await
         {
-            Ok(u) => u,
+            Ok(o) => o,
             Err(e) => {
                 self.log(format!("check failed: {e}"));
                 let _ = self.ev.send(Ev::Failed { key: String::new(), msg: format!("Check: {e}") });
-                return vec![];
+                return Default::default();
             }
         };
         self.save_state();
-        if !updates.is_empty() {
-            self.log(format!("{} update(s) available", updates.len()));
+        if !outcome.updates.is_empty() {
+            self.log(format!("{} update(s) available", outcome.updates.len()));
         }
-        let _ = self.ev.send(Ev::CheckDone { updates: updates.clone() });
-        updates
+        // AF-18: partial failures must never read as a complete success
+        for (label, msg) in &outcome.failed {
+            self.log(format!("check: {label} failed: {msg} (cached data used)"));
+        }
+        if outcome.offline {
+            self.log("check: offline mode, evaluated from cache only");
+        }
+        let _ = self.ev.send(Ev::CheckDone {
+            updates: outcome.updates.clone(),
+            failed: outcome.failed.clone(),
+            offline: outcome.offline,
+        });
+        outcome
     }
 
     async fn do_apply(&mut self, infos: Vec<UpdateInfo>) {
@@ -511,7 +522,7 @@ impl Worker {
         self.save_state();
     }
 
-    async fn do_install_new(&mut self, provider: ProviderKind, external_id: String, name: String) {
+    async fn do_install_new(&mut self, provider: ProviderKind, external_id: String, name: String, channel: Option<Channel>) {
         let reg = Registry::new(&self.ctx);
         let Some(dir) = self.addons_dir() else {
             self.log("install: no AddOns directory configured");
@@ -519,7 +530,10 @@ impl Worker {
         };
         let ev = self.ev.clone();
         let key = AddonState::key(provider, &external_id);
-        let sel = self.sel(self.cfg.updates.channel);
+        // AF-20: pick the artifact under the requested channel (imported
+        // entries carry one), not always the global default
+        let channel = channel.unwrap_or(self.cfg.updates.channel);
+        let sel = self.sel(channel);
         let prov = reg.get(provider);
         let owned = self.store.folder_owners();
         let res: Result<(), String> = async {
@@ -560,7 +574,7 @@ impl Worker {
                 installed_version: outcome.version.clone(),
                 installed_file_id: Some(file.file_id.clone()),
                 size_bytes: outcome.size_bytes,
-                channel: self.cfg.updates.channel,
+                channel,
                 auto_update: self.cfg.updates.auto_update,
                 ignored: false,
                 manual: provider == ProviderKind::Zip,
@@ -652,6 +666,14 @@ impl Worker {
                 return;
             }
         };
+        if manifest.version > 1 {
+            self.log(format!("import failed: unsupported manifest version {}", manifest.version));
+            let _ = self.ev.send(Ev::Failed {
+                key: "import".into(),
+                msg: format!("unsupported manifest version {} (this build reads version 1)", manifest.version),
+            });
+            return;
+        }
         let n = manifest.addons.len();
         self.log(format!("importing {n} addon(s) from {}", path.display()));
         let mut ok = 0usize;
@@ -660,11 +682,12 @@ impl Worker {
                 self.log(format!("import skip `{}`: unknown provider `{}`", e.name, e.provider));
                 continue;
             };
-            self.do_install_new(provider, e.external_id.clone(), e.name.clone()).await;
+            let entry_channel = Channel::from_key(&e.channel);
+            self.do_install_new(provider, e.external_id.clone(), e.name.clone(), entry_channel).await;
             let key = addons_forever_core::store::AddonState::key(provider, &e.external_id);
             if let Some(st) = self.store.addons.get_mut(&key) {
                 st.auto_update = e.auto_update;
-                if let Some(ch) = Channel::from_key(&e.channel) {
+                if let Some(ch) = entry_channel {
                     st.channel = ch;
                 }
                 ok += 1;
@@ -929,6 +952,7 @@ async fn run(
 
     // startup jobs
     let cfg0 = w.cfg.clone();
+    let mut startup_check_done = false;
     if cfg0.app.addons_dir.is_some() || cfg0.app.auto_detect {
         if cfg0.ui.scan_on_start {
             w.do_scan().await;
@@ -936,21 +960,27 @@ async fn run(
             w.log("startup scan disabled ([ui] scan_on_start = false)");
         }
         if cfg0.updates.check_on_startup {
-            let updates = w.do_check().await;
+            let outcome = w.do_check().await;
             if cfg0.updates.auto_update {
-                let targets = update::auto_update_targets(&w.store, &updates);
+                let targets = update::auto_update_targets(&w.store, &outcome.updates);
                 if !targets.is_empty() {
                     w.log(format!("auto-update: {} addon(s)", targets.len()));
                     w.do_apply(targets).await;
                 }
             }
+            // AF-11: a startup check counts as a completed check, so the
+            // periodic scheduler is armed without needing a manual Check
+            startup_check_done = true;
         }
     } else {
         w.log("AddOns folder not configured. Open Settings.");
     }
     w.do_check_app_update(false).await;
 
-    let mut last_check: i64 = 0;
+    // AF-11: arm the periodic cycle from the startup check (a run check set
+    // `last_check` before, which is why auto-update only ever worked after a
+    // manual Check)
+    let mut last_check: i64 = if startup_check_done { now_unix() } else { 0 };
     let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -975,8 +1005,9 @@ async fn run(
                     }
                     Cmd::Check => { w.do_check().await; last_check = now_unix(); }
                     Cmd::ApplyAll => {
-                        let updates = w.do_check().await;
-                        w.do_apply(updates).await;
+                        let outcome = w.do_check().await;
+                        w.do_apply(outcome.updates).await;
+                        last_check = now_unix(); // AF-11: any completed check arms the scheduler
                     }
                     Cmd::ApplyKey(key) => {
                         let info = w.store.addons.get(&key).and_then(|st| {
@@ -996,12 +1027,12 @@ async fn run(
                         }
                     }
                     Cmd::InstallExisting(key) => w.do_install_existing(key).await,
-                    Cmd::InstallNew { provider, external_id, name } => {
-                        w.do_install_new(provider, external_id, name).await
+                    Cmd::InstallNew { provider, external_id, name, channel } => {
+                        w.do_install_new(provider, external_id, name, channel).await
                     }
                     Cmd::InstallUrl(url) => match parse_install_url(&w.ctx, &url).await {
                         Ok((provider, external_id, name)) => {
-                            w.do_install_new(provider, external_id, name).await
+                            w.do_install_new(provider, external_id, name, None).await
                         }
                         Err(msg) => {
                             let _ = w.ev.send(Ev::Failed { key: "install-url".into(), msg: msg.clone() });
@@ -1063,8 +1094,8 @@ async fn run(
                     && now_unix() - last_check >= (c.updates.interval_minutes as i64) * 60
                 {
                     w.log("scheduled update check");
-                    let updates = w.do_check().await;
-                    let targets = update::auto_update_targets(&w.store, &updates);
+                    let outcome = w.do_check().await;
+                    let targets = update::auto_update_targets(&w.store, &outcome.updates);
                     w.do_apply(targets).await;
                     last_check = now_unix();
                 }
