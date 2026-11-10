@@ -160,9 +160,22 @@ pub(crate) async fn scan_with_providers(
 pub fn apply_scan_report(store: &mut StateStore, report: &ScanReport, cfg: &AppConfig) {
     let mut next: BTreeMap<String, AddonState> = BTreeMap::new();
 
+    // AF-12: user-pinned sources are indexed by their installed folders, so
+    // a pin survives provider re-detection and restarts (the pin wins over
+    // whatever provider id the scan derived).
+    let mut pins: std::collections::HashMap<String, &AddonOverride> = Default::default();
+    for ov in cfg.addons.values().filter(|o| o.pinned) {
+        for f in &ov.folders {
+            pins.insert(f.to_lowercase(), ov);
+        }
+    }
+
     for m in &report.matched {
         let base_key = AddonState::key(m.provider, &m.external_id);
-        let ov: Option<&AddonOverride> = cfg.addons.get(&base_key);
+        let ov: Option<&AddonOverride> = cfg
+            .addons
+            .get(&base_key)
+            .or_else(|| m.folders.iter().find_map(|f| pins.get(&f.to_lowercase()).copied()));
         let provider = ov.and_then(|o| o.provider).unwrap_or(m.provider);
         let external_id = ov
             .and_then(|o| o.external_id.clone())
@@ -197,7 +210,9 @@ pub fn apply_scan_report(store: &mut StateStore, report: &ScanReport, cfg: &AppC
                     .installed_version
                     .clone()
                     .or_else(|| old.and_then(|o| o.installed_version.clone())),
-                installed_file_id: old.and_then(|o| o.installed_file_id.clone()),
+                installed_file_id: ov
+                    .and_then(|o| o.installed_file_id.clone())
+                    .or_else(|| old.and_then(|o| o.installed_file_id.clone())),
                 channel: ov
                     .and_then(|o| o.channel)
                     .or_else(|| old.map(|o| o.channel))
@@ -210,7 +225,8 @@ pub fn apply_scan_report(store: &mut StateStore, report: &ScanReport, cfg: &AppC
                     .and_then(|o| o.ignored)
                     .or_else(|| old.map(|o| o.ignored))
                     .unwrap_or(false),
-                manual: old.map(|o| o.manual).unwrap_or(false),
+                manual: ov.map(|o| o.pinned).unwrap_or(false)
+                    || old.map(|o| o.manual).unwrap_or(false),
                 cached_remote: Some(m.meta.clone()),
                 cached_at: Some(report.scanned_at),
                 last_checked: old.and_then(|o| o.last_checked),
@@ -456,6 +472,64 @@ mod tests {
         std::fs::create_dir_all(addons.join(".dotdir")).unwrap();
         std::fs::write(addons.join(".dotdir").join("x.toc"), b"## Title: Nope\n").unwrap();
         (tmp, addons)
+    }
+
+    #[test]
+    fn manual_pin_survives_provider_redetection_and_restart() {
+        // AF-12: a user-pinned source (folder-based) wins over fresh provider
+        // detection, keeps the installed file identity, and has exactly one
+        // owner row; the pin and identity persist through the ini.
+        let mut cfg = AppConfig::default();
+        cfg.addons.insert(
+            "github:BigWigsMods/BigWigs".into(),
+            AddonOverride {
+                provider: Some(ProviderKind::GitHub),
+                external_id: Some("BigWigsMods/BigWigs".into()),
+                name: Some("BigWigs".into()),
+                folders: vec!["BigWigs".into()],
+                pinned: true,
+                installed_file_id: Some("rel-9".into()),
+                ..Default::default()
+            },
+        );
+        let report = ScanReport {
+            matched: vec![ScanMatch {
+                provider: ProviderKind::Curse,
+                external_id: "2382".into(),
+                folders: vec!["BigWigs".into()],
+                meta: RemoteMeta {
+                    provider: ProviderKind::Curse,
+                    external_id: "2382".into(),
+                    name: "BigWigs (Curse)".into(),
+                    author: None,
+                    site_url: None,
+                    repo_url: None,
+                    description: None,
+                    icon_url: None,
+                    downloads: None,
+                    updated_at: None,
+                    files: vec![],
+                },
+                installed_version: Some("1.0".into()),
+            }],
+            unmatched: vec![],
+            scanned_at: 1,
+            folder_sizes: Default::default(),
+        };
+        let mut store = StateStore::default();
+        apply_scan_report(&mut store, &report, &cfg);
+
+        let st = store.get(ProviderKind::GitHub, "BigWigsMods/BigWigs").expect("pin survives redetection");
+        assert!(st.manual);
+        assert_eq!(st.installed_file_id.as_deref(), Some("rel-9"), "file id restored from ini");
+        assert_eq!(st.provider, ProviderKind::GitHub, "pin wins over detection");
+        assert!(store.get(ProviderKind::Curse, "2382").is_none(), "exactly one owner row");
+
+        let mut cfg2 = AppConfig::default();
+        store.write_overrides(&mut cfg2);
+        let ov = &cfg2.addons["github:BigWigsMods/BigWigs"];
+        assert!(ov.pinned, "pin persists");
+        assert_eq!(ov.installed_file_id.as_deref(), Some("rel-9"), "file id persists");
     }
 
     #[test]

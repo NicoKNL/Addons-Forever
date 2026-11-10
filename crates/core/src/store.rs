@@ -103,6 +103,8 @@ impl StateStore {
                 channel: Some(a.channel),
                 auto_update: Some(a.auto_update),
                 ignored: Some(a.ignored),
+                pinned: a.manual,
+                installed_file_id: a.installed_file_id.clone(),
             };
             if *e != next {
                 *e = next;

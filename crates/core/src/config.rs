@@ -189,6 +189,13 @@ pub struct AddonOverride {
     pub channel: Option<Channel>,
     pub auto_update: Option<bool>,
     pub ignored: Option<bool>,
+    /// AF-12: the user explicitly chose this source (source override, zip
+    /// URL). Pins re-attach by folder on every scan, survive restarts, and
+    /// outrank automatic provider detection.
+    pub pinned: bool,
+    /// AF-12: identity (file id) of what is installed, so "same file" is
+    /// known across restarts.
+    pub installed_file_id: Option<String>,
 }
 
 impl AppConfig {
@@ -263,6 +270,10 @@ impl AppConfig {
             kv_opt(&mut s, "channel", o.channel.map(|c| c.as_str()));
             kv_bool_opt(&mut s, "auto_update", o.auto_update);
             kv_bool_opt(&mut s, "ignored", o.ignored);
+            if o.pinned {
+                kv(&mut s, "pinned", "true");
+            }
+            kv_opt(&mut s, "installed_file_id", o.installed_file_id.as_deref());
             s.push('\n');
         }
         s
@@ -378,6 +389,11 @@ fn cfg_from_ini(ini: &Ini) -> Result<AppConfig> {
         o.channel = s.get("channel").and_then(Channel::parse);
         o.auto_update = s.get("auto_update").map(|v| parse_bool(v, true));
         o.ignored = s.get("ignored").map(|v| parse_bool(v, false));
+        o.pinned = s.get("pinned").map(|v| parse_bool(v, false)).unwrap_or(false);
+        o.installed_file_id = s
+            .get("installed_file_id")
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
         cfg.addons.insert(key, o);
     }
     Ok(cfg)
@@ -507,6 +523,8 @@ mod tests {
                 external_id: Some("BigWigsMods/BigWigs".into()),
                 folders: vec!["BigWigs".into(), "BigWigs_Core".into()],
                 auto_update: Some(false),
+                pinned: true,
+                installed_file_id: Some("release-42".into()),
                 ..Default::default()
             },
         );
