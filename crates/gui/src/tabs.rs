@@ -908,10 +908,8 @@ pub fn settings_tab(app: &mut AppGui, ui: &mut egui::Ui) {
                 ui.label("GitHub token (optional)");
                 ui.add(egui::TextEdit::singleline(&mut form.network.github_token).password(true).desired_width(360.0));
             });
-            ui.horizontal(|ui| {
-                ui.label("Wago key (optional)");
-                ui.add(egui::TextEdit::singleline(&mut form.network.wago_api_key).password(true).desired_width(360.0));
-            });
+            // No Wago provider exists yet: the old key field implied one did
+            // (review M-01). The config key stays for forward compatibility.
             ui.checkbox(&mut form.network.offline, "Offline mode (never touch the network)").on_hover_text("Browse cached state only; no requests at all");
         });
 
@@ -978,7 +976,8 @@ pub fn settings_tab(app: &mut AppGui, ui: &mut egui::Ui) {
             });
             ui.label(egui::RichText::new(
                 "Everything the app knows lives in this folder: addons-forever.ini and the managed addons \
-                 themselves. No state files, no logs on disk, nothing uploaded anywhere.",
+                 themselves. No logs are written to disk, and nothing is uploaded anywhere \
+                 (see PRIVACY.md). Installs use a temporary .fa-tmp folder next to AddOns.",
             )
             .small()
             .weak());
