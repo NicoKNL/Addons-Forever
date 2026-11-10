@@ -74,6 +74,19 @@ impl AddonState {
 }
 
 impl StateStore {
+    /// Map of lowercased AddOns folder name -> store key of the addon that
+    /// owns it. The install pipeline uses it to refuse replacing a folder that
+    /// belongs to a different managed addon.
+    pub fn folder_owners(&self) -> BTreeMap<String, String> {
+        let mut map = BTreeMap::new();
+        for st in self.addons.values() {
+            for f in &st.folders {
+                map.entry(f.to_lowercase()).or_insert_with(|| st.key.clone());
+            }
+        }
+        map
+    }
+
     /// Persist the user-intent part of the store into the config's
     /// `[addon ...]` override sections (auto-update, channel, ignored, name,
     /// folders, provider pinning). Returns true if the config changed.

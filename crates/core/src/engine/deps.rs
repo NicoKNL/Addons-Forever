@@ -78,13 +78,22 @@ pub fn declared_dependencies(addons_dir: &Path, folders: &[String]) -> Vec<Decla
 /// offered as separate installs.
 pub fn embedded_names(addons_dir: &Path, folders: &[String]) -> Vec<String> {
     fn titles_in(dir: &Path, out: &mut Vec<String>) {
+        titles_in_depth(dir, out, 0);
+    }
+    // bounded depth (the doc promises two levels) and never follows symlinks,
+    // so a directory loop cannot blow the stack
+    fn titles_in_depth(dir: &Path, out: &mut Vec<String>, depth: usize) {
+        if depth > 2 {
+            return;
+        }
         let Ok(entries) = std::fs::read_dir(dir) else { return };
         for e in entries.flatten() {
             let path = e.path();
             let name = e.file_name().to_string_lossy().to_string();
-            if path.is_dir() {
+            let Ok(ft) = e.file_type() else { continue };
+            if ft.is_dir() {
                 out.push(name.clone());
-                titles_in(&path, out);
+                titles_in_depth(&path, out, depth + 1);
             } else if path.extension().map(|x| x.eq_ignore_ascii_case("toc")).unwrap_or(false) {
                 let Ok(text) = std::fs::read_to_string(&path) else { continue };
                 for line in text.lines().take(40) {

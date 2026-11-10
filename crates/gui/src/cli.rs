@@ -150,11 +150,15 @@ async fn dispatch(data_dir: &std::path::Path, config_path: &std::path::Path, cfg
             let metas = prov.meta(&ctx, std::slice::from_ref(&external_id)).await.map_err(|e| e.to_string())?;
             let meta = metas.into_iter().next().ok_or("source returned no data")?;
             let file = prov.pick(&meta, &sel).ok_or("no compatible file")?;
+            let owned = store.folder_owners();
+            let my_key = AddonState::key(provider, &external_id);
             let outcome = addons_forever_core::engine::install::install(
                 &ctx,
                 &addons_dir,
                 &meta,
                 &file,
+                &owned,
+                &my_key,
                 &mut |p| {
                     if let addons_forever_core::engine::install::InstallProgress::Downloading { bytes, total } = p {
                         eprint!("\r{bytes}/{} bytes", total.unwrap_or(0));
@@ -362,8 +366,9 @@ async fn dispatch(data_dir: &std::path::Path, config_path: &std::path::Path, cfg
                         .map_err(|e| e.to_string())?;
                     let meta = metas.into_iter().next().ok_or("provider returned no data")?;
                     let file = prov.pick(&meta, &sel).ok_or("no compatible file for this client/channel")?;
+                    let owned = store.folder_owners();
                     let outcome = addons_forever_core::engine::install::install(
-                        &ctx, &addons_dir, &meta, &file, &mut |_| {},
+                        &ctx, &addons_dir, &meta, &file, &owned, &key, &mut |_| {},
                     )
                     .await
                     .map_err(|e| e.to_string())?;

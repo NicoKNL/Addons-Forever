@@ -30,6 +30,10 @@ pub const ALLOWED_HOSTS: &[&str] = &[
     "addons.wago.io",
 ];
 
+/// Largest initial allocation the downloader will ever reserve (the real
+/// bound is enforced per received byte while streaming).
+const MAX_ALLOC_PREFLIGHT: u64 = 512 * 1024 * 1024;
+
 pub fn host_allowed(url: &str) -> bool {
     let Ok(parsed) = reqwest::Url::parse(url) else {
         return false;
@@ -127,15 +131,26 @@ pub async fn get_json<T: DeserializeOwned>(
 }
 
 /// Stream a download to disk with progress callbacks (bytes, total).
+/// `max_bytes`, when set, is enforced while streaming: the transfer aborts as
+/// soon as more than that many bytes have been received, so the cap is a real
+/// bound and not a post-hoc check.
 pub async fn download_to(
     client: &reqwest::Client,
     url: &str,
     headers: &[(String, String)],
     dest: &std::path::Path,
     extra_hosts: &[String],
+    max_bytes: Option<u64>,
     on_progress: &mut (dyn FnMut(u64, Option<u64>) + Send),
 ) -> Result<Vec<u8>> {
     ensure_allowed(url, extra_hosts)?;
+    if let Some(size) = max_bytes {
+        // a huge declared Content-Length must not drive a huge reservation
+        // before a single body byte arrives
+        if size > MAX_ALLOC_PREFLIGHT {
+            return Err(Error::provider("http", format!("{url}: declared size {size} exceeds the limit")));
+        }
+    }
     let mut req = client.get(url);
     for (k, v) in headers {
         req = req.header(k.as_str(), v.as_str());
@@ -146,7 +161,13 @@ pub async fn download_to(
         return Err(Error::provider("http", format!("GET {url} -> {status}")));
     }
     let total = resp.content_length();
-    let mut buf = Vec::with_capacity(total.unwrap_or(0) as usize + 1024);
+    if let (Some(cap), Some(t)) = (max_bytes, total) {
+        if t > cap {
+            return Err(Error::provider("http", format!("{url}: content length {t} exceeds the {cap} byte cap")));
+        }
+    }
+    // never reserve remote-supplied capacity beyond a modest floor
+    let mut buf = Vec::with_capacity(total.unwrap_or(0).min(4 * 1024 * 1024) as usize);
     let stream = resp.bytes_stream();
     use futures::StreamExt;
     let mut last_report = std::time::Instant::now();
@@ -154,6 +175,11 @@ pub async fn download_to(
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
         buf.extend_from_slice(&chunk);
+        if let Some(cap) = max_bytes {
+            if buf.len() as u64 > cap {
+                return Err(Error::provider("http", format!("{url}: exceeded the {cap} byte cap during transfer")));
+            }
+        }
         if last_report.elapsed() >= Duration::from_millis(200) {
             on_progress(buf.len() as u64, total);
             last_report = std::time::Instant::now();

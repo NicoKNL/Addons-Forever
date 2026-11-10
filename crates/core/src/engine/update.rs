@@ -222,9 +222,10 @@ pub(crate) async fn apply_updates_with(
         &UpdateInfo,
         Box<dyn FnMut(InstallProgress) + Send>,
     ) -> BoxFuture<'static, Result<Vec<u8>>>,
-    prune: bool,
 ) -> Result<ApplySummary> {
     let mut summary = ApplySummary::default();
+    // ownership snapshot for AF-06/AF-08, taken before any mutation
+    let owned = store.folder_owners();
     for info in infos {
         let Some(state) = store.addons.get(&info.key) else {
             summary.failed.push((info.key.clone(), "not found in store".into()));
@@ -262,8 +263,13 @@ pub(crate) async fn apply_updates_with(
             }
         };
         let mut progress = |p: InstallProgress| on_progress(&info.key, &p);
-        match install::install_from_bytes(ctx, addons_dir, &meta, &info.target, bytes, &mut progress).await {
+        match install::install_from_bytes(ctx, addons_dir, &meta, &info.target, bytes, &owned, &info.key, &mut progress).await {
             Ok(outcome) => {
+                let old_folders = store
+                    .addons
+                    .get(&info.key)
+                    .map(|s| s.folders.clone())
+                    .unwrap_or_default();
                 if let Some(state) = store.addons.get_mut(&info.key) {
                     state.installed_file_id = Some(info.target.file_id.clone());
                     state.installed_version =
@@ -271,15 +277,16 @@ pub(crate) async fn apply_updates_with(
                     state.folders = outcome.folders.clone();
                     state.pending_update = None;
                 }
+                // AF-08: folders the update dropped are removed (ownership map
+                // is the pre-update one, so foreign folders are left alone)
+                for r in install::cleanup_dropped_roots(addons_dir, &old_folders, &outcome.folders, &owned, &info.key) {
+                    tracing::info!("removed folder {r}, dropped by the update of {}", info.key);
+                }
                 summary.updated += 1;
                 summary.updated_keys.push((info.key.clone(), outcome.version.clone()));
             }
             Err(e) => summary.failed.push((info.key.clone(), e.to_string())),
         }
-    }
-    if prune {
-        let keep = if ctx.cfg.updates.keep_backups { 3 } else { 1 };
-        install::prune_backups(&install::fa_tmp_dir(addons_dir).join("backup"), keep)?;
     }
     Ok(summary)
 }
@@ -310,7 +317,7 @@ pub async fn apply_updates(
             .await
         })
     };
-    apply_updates_with(ctx, store, infos, addons_dir, on_progress, &mut fetch, true).await
+    apply_updates_with(ctx, store, infos, addons_dir, on_progress, &mut fetch).await
 }
 
 /// The subset of available updates the user allowed to auto-update.
@@ -511,7 +518,7 @@ mod tests {
 
         let ctx = ctx();
         let summary =
-            apply_updates_with(&ctx, &mut store, &infos, &addons, &mut on_progress, &mut fetch, false)
+            apply_updates_with(&ctx, &mut store, &infos, &addons, &mut on_progress, &mut fetch)
                 .await
                 .unwrap();
         assert_eq!(summary.updated, 1);
@@ -753,7 +760,6 @@ mod tests {
             &addons,
             &mut |_, _| {},
             &mut fetch,
-            true,
         )
         .await
         .unwrap();

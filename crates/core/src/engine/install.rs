@@ -19,6 +19,8 @@ pub const MAX_DOWNLOAD_BYTES: u64 = 200 * 1024 * 1024;
 const MAX_ENTRY_BYTES: u64 = 512 * 1024 * 1024;
 /// Cap for the total unpacked size.
 const MAX_UNPACKED_TOTAL: u128 = 2 * 1024 * 1024 * 1024;
+/// Cap for the number of archive entries (inode/CPU exhaustion guard).
+const MAX_ENTRIES: usize = 20_000;
 
 /// Install progress notifications.
 #[derive(Clone, Debug, PartialEq)]
@@ -41,10 +43,6 @@ pub struct InstallOutcome {
     pub size_bytes: u64,
     /// `## Interface:` numbers found in the installed TOCs (sorted, unique).
     pub interfaces: Vec<u32>,
-}
-
-fn now_unix() -> i64 {
-    chrono::Utc::now().timestamp()
 }
 
 fn zip_err(e: impl std::fmt::Display) -> Error {
@@ -154,6 +152,13 @@ fn extract_zip(bytes: &[u8], dest: &Path) -> Result<()> {
             return Err(zip_err("archive unpacks beyond the size limit"));
         }
     }
+    if archive.len() > MAX_ENTRIES {
+        return Err(zip_err(format!(
+            "archive has too many entries ({} > {})",
+            archive.len(),
+            MAX_ENTRIES
+        )));
+    }
 
     let mut entries: Vec<(usize, PathBuf, bool)> = Vec::new();
     for i in 0..archive.len() {
@@ -193,7 +198,13 @@ fn extract_zip(bytes: &[u8], dest: &Path) -> Result<()> {
         }
         let mut zf = archive.by_index(i).map_err(zip_err)?;
         let mut out = std::fs::File::create(&target)?;
-        std::io::copy(&mut zf, &mut out)?;
+        // real received bytes, not the header's declared size
+        let mut limited = std::io::Read::take(&mut zf, MAX_ENTRY_BYTES + 1);
+        let n = std::io::copy(&mut limited, &mut out)?;
+        if n > MAX_ENTRY_BYTES {
+            let _ = std::fs::remove_file(&target);
+            return Err(zip_err(format!("entry unpacks beyond the size limit: {}", rel.display())));
+        }
         out.flush()?;
     }
     Ok(())
@@ -253,17 +264,19 @@ fn detect_roots(extract: &Path, zip_name: &str, flavor: crate::flavor::Flavor) -
     Ok(vec![(root, root_name)])
 }
 
+/// Copy a tree, skipping symlinks (never following them out of the tree).
 fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
     std::fs::create_dir_all(dst)?;
     for e in std::fs::read_dir(src)? {
         let e = e?;
         let from = e.path();
         let to = dst.join(e.file_name());
-        if from.is_dir() {
+        let ft = e.file_type()?; // does not follow symlinks
+        if ft.is_dir() {
             copy_dir_all(&from, &to)?;
-        } else {
+        } else if ft.is_file() {
             std::fs::copy(&from, &to)?;
-        }
+        } // symlinks and specials: skipped by design
     }
     Ok(())
 }
@@ -280,39 +293,70 @@ fn move_dir(src: &Path, dst: &Path) -> Result<()> {
     }
 }
 
-fn restore_backups(backup_dir: &Path, names: &[String], addons_dir: &Path) {
+/// Move installed folders back out of AddOns after a swap failed. Returns the
+/// names that could not be restored (caller must surface them).
+fn restore_backups(backup_dir: &Path, names: &[String], addons_dir: &Path) -> Vec<String> {
+    let mut failed = Vec::new();
     for name in names {
         let dst = addons_dir.join(name);
         let src = backup_dir.join(name);
         let _ = std::fs::remove_dir_all(&dst); // partial new install
         if src.is_dir()
-            && std::fs::rename(&src, &dst).is_err() {
-                let _ = copy_dir_all(&src, &dst);
-            }
+            && std::fs::rename(&src, &dst).is_err()
+            && copy_dir_all(&src, &dst).is_err()
+        {
+            failed.push(name.clone());
+        }
     }
+    failed
 }
 
-/// Remove existing target dirs, then move the extracted roots in. Any error
-/// propagates so the caller can restore backups.
-fn do_swap(addons_dir: &Path, roots: &[(PathBuf, String)], names: &[String]) -> Result<()> {
+/// Backup-then-swap. Existing folders are moved (renamed when possible) into
+/// `backup_dir` first, so an interrupted swap never leaves a folder half
+/// deleted: the previous content is recoverable from the backup directory.
+fn do_swap(addons_dir: &Path, roots: &[(PathBuf, String)], names: &[String], backup_dir: &Path) -> Result<()> {
+    let mut backed_up: Vec<String> = Vec::new();
     for name in names {
         let existing = addons_dir.join(name);
         if existing.exists() {
-            std::fs::remove_dir_all(&existing)?;
+            std::fs::create_dir_all(backup_dir)?;
+            if let Err(e) = move_dir(&existing, &backup_dir.join(name)) {
+                // undo the moves we already made, then bail
+                let _ = restore_backups(backup_dir, &backed_up, addons_dir);
+                return Err(e);
+            }
+            backed_up.push(name.clone());
         }
     }
     for (src, name) in roots {
-        move_dir(src, &addons_dir.join(name))?;
+        if let Err(e) = move_dir(src, &addons_dir.join(name)) {
+            let mut undo = backed_up.clone();
+            if !undo.contains(name) {
+                undo.push(name.clone());
+            }
+            let failed = restore_backups(backup_dir, &undo, addons_dir);
+            let mut msg = format!("install failed: {e}");
+            if !failed.is_empty() {
+                msg.push_str(&format!(
+                    "; ROLLBACK FAILED for [{}, restore manually from {}]",
+                    failed.join(", "),
+                    backup_dir.display()
+                ));
+            }
+            return Err(Error::provider("install", msg));
+        }
     }
     Ok(())
 }
 
-/// Keep the newest `keep` timestamped backup snapshots, delete older ones.
-pub(crate) fn prune_backups(backup_root: &Path, keep: usize) -> Result<()> {
-    if !backup_root.is_dir() {
+/// Keep the newest `keep` snapshots under `backup_root/<key>/`, delete older
+/// ones. Snapshots are named by millisecond timestamps.
+pub(crate) fn prune_backups(backup_root: &Path, key: &str, keep: usize) -> Result<()> {
+    let key_dir = backup_root.join(snapshot_slug(key));
+    if !key_dir.is_dir() {
         return Ok(());
     }
-    let mut snaps: Vec<i64> = std::fs::read_dir(backup_root)?
+    let mut snaps: Vec<i64> = std::fs::read_dir(&key_dir)?
         .filter_map(|e| e.ok())
         .filter(|e| e.path().is_dir())
         .filter_map(|e| e.file_name().to_string_lossy().parse::<i64>().ok())
@@ -320,9 +364,25 @@ pub(crate) fn prune_backups(backup_root: &Path, keep: usize) -> Result<()> {
     snaps.sort_unstable();
     snaps.reverse();
     for old in snaps.iter().skip(keep) {
-        let _ = std::fs::remove_dir_all(backup_root.join(old.to_string()));
+        let _ = std::fs::remove_dir_all(key_dir.join(old.to_string()));
     }
     Ok(())
+}
+
+/// Filesystem-safe slug for a store key in backup paths.
+fn snapshot_slug(key: &str) -> String {
+    let s: String = key
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    if s.is_empty() { "unknown".into() } else { s }
+}
+
+/// Per-transaction backup snapshot dir: `backup/<addon key>/<millis>`.
+fn snapshot_dir(tmp: &Path, key: &str) -> PathBuf {
+    tmp.join("backup")
+        .join(snapshot_slug(key))
+        .join(chrono::Utc::now().timestamp_millis().to_string())
 }
 
 /// Download an archive into the `.fa-tmp` scratch dir and return its bytes
@@ -350,20 +410,19 @@ pub(crate) async fn download_zip(
             }
         }
     }
+    // pre-flight: a provider-announced size over the cap never starts
+    if file.size.is_some_and(|s| s > MAX_DOWNLOAD_BYTES) {
+        return Err(Error::provider("install", "download exceeds the 200 MiB cap"));
+    }
 
-    let mut over_cap = false;
     let downloaded = net::download_to(
         &ctx.http,
         &file.url,
         &headers,
         &zip_path,
         &extra_hosts,
-        &mut |bytes, total| {
-            if bytes > MAX_DOWNLOAD_BYTES {
-                over_cap = true;
-            }
-            on_progress(bytes, total);
-        },
+        Some(MAX_DOWNLOAD_BYTES),
+        &mut |bytes, total| on_progress(bytes, total),
     )
     .await;
     let bytes = match downloaded {
@@ -374,19 +433,21 @@ pub(crate) async fn download_zip(
         }
     };
     let _ = std::fs::remove_file(&zip_path);
-    if over_cap || bytes.len() as u64 > MAX_DOWNLOAD_BYTES {
-        return Err(Error::provider("install", "download exceeds the 200 MiB cap"));
-    }
     Ok(bytes)
 }
 
 /// Install one remote file: download (allowlisted, capped), hash-verify,
-/// sanitized extract, layout detection, backup + atomic swap with rollback.
+/// sanitized extract, layout detection, backup + swap with rollback.
+/// `owned` maps lowercased AddOns folder names to the store key that owns
+/// them; `my_key` is the addon being installed. Folders owned by a *different*
+/// addon are never replaced (AF-06).
 pub async fn install(
     ctx: &AppCtx,
     addons_dir: &Path,
     meta: &RemoteMeta,
     file: &RemoteFile,
+    owned: &std::collections::BTreeMap<String, String>,
+    my_key: &str,
     on_progress: &mut (dyn FnMut(InstallProgress) + Send),
 ) -> Result<InstallOutcome> {
     ctx.ensure_online()?;
@@ -394,7 +455,7 @@ pub async fn install(
         on_progress(InstallProgress::Downloading { bytes, total });
     })
     .await?;
-    install_from_bytes(ctx, addons_dir, meta, file, bytes, on_progress).await
+    install_from_bytes(ctx, addons_dir, meta, file, bytes, owned, my_key, on_progress).await
 }
 
 /// The network-free half of [`install`]: verify, extract, detect, apply.
@@ -404,6 +465,8 @@ pub(crate) async fn install_from_bytes(
     _meta: &RemoteMeta,
     file: &RemoteFile,
     bytes: Vec<u8>,
+    owned: &std::collections::BTreeMap<String, String>,
+    my_key: &str,
     on_progress: &mut (dyn FnMut(InstallProgress) + Send),
 ) -> Result<InstallOutcome> {
     verify_hashes(&bytes, file.md5.as_deref(), file.sha1.as_deref())?;
@@ -439,28 +502,33 @@ pub(crate) async fn install_from_bytes(
             }
         }
     }
-
-    on_progress(InstallProgress::BackingUp);
-    let backup_dir = tmp.join("backup").join(now_unix().to_string());
-    for name in &names {
-        let existing = addons_dir.join(name);
-        if existing.exists() {
-            if let Err(e) = copy_dir_all(&existing, &backup_dir.join(name)) {
+    // AF-06: never clobber folders that belong to a different managed addon.
+    for n in &names {
+        if let Some(owner) = owned.get(&n.to_lowercase()) {
+            if !owner.eq_ignore_ascii_case(my_key) {
                 let _ = std::fs::remove_dir_all(&extract);
-                return Err(e);
+                return Err(Error::provider(
+                    "install",
+                    format!("archive contains folder {n}, which is owned by {owner}; remove that addon first"),
+                ));
             }
         }
     }
 
+    on_progress(InstallProgress::BackingUp);
+    let backup_dir = snapshot_dir(&tmp, my_key);
+    let existing_any = names.iter().any(|n| addons_dir.join(n).exists());
+
     on_progress(InstallProgress::Swapping);
-    if let Err(e) = do_swap(addons_dir, &roots, &names) {
-        restore_backups(&backup_dir, &names, addons_dir);
+    if let Err(e) = do_swap(addons_dir, &roots, &names, &backup_dir) {
         let _ = std::fs::remove_dir_all(&extract);
         return Err(e);
     }
     let _ = std::fs::remove_dir_all(&extract);
 
     // Re-parse the installed TOCs for the authoritative installed state.
+    // A read failure here is not fatal: the install already succeeded, the
+    // version is simply unknown until the next scan.
     let mut version = None;
     let mut interfaces: Vec<u32> = Vec::new();
     let mut size_bytes = 0u64;
@@ -468,21 +536,66 @@ pub(crate) async fn install_from_bytes(
         let dir = addons_dir.join(name);
         size_bytes += dir_size(&dir);
         if let Some(toc_path) = toc::find_toc(&dir, name, flavor) {
-            let parsed = toc::parse(&toc::decode_text(&std::fs::read(&toc_path)?));
-            if version.is_none() {
-                version = parsed.version.clone();
-            }
-            for i in parsed.interface {
-                if !interfaces.contains(&i) {
-                    interfaces.push(i);
+            match std::fs::read(&toc_path) {
+                Ok(raw) => {
+                    let parsed = toc::parse(&toc::decode_text(&raw));
+                    if version.is_none() {
+                        version = parsed.version.clone();
+                    }
+                    for i in parsed.interface {
+                        if !interfaces.contains(&i) {
+                            interfaces.push(i);
+                        }
+                    }
                 }
+                Err(e) => tracing::warn!("installed TOC unreadable ({name}): {e}"),
             }
         }
     }
     interfaces.sort_unstable();
 
+    // retention: keep the newest N snapshots for this addon (0 = none)
+    if existing_any {
+        let keep = if ctx.cfg.updates.keep_backups { 3 } else { 0 };
+        let _ = prune_backups(&tmp.join("backup"), my_key, keep);
+    }
+
     on_progress(InstallProgress::Done);
     Ok(InstallOutcome { folders: names, version, interfaces, size_bytes })
+}
+
+/// After a successful update, remove folders the old version owned and the
+/// new one no longer ships (AF-08). Folders currently owned by a *different*
+/// addon are left alone. `owned` is the pre-update ownership map. Returns the
+/// removed names.
+pub fn cleanup_dropped_roots(
+    addons_dir: &Path,
+    old_folders: &[String],
+    new_folders: &[String],
+    owned: &std::collections::BTreeMap<String, String>,
+    my_key: &str,
+) -> Vec<String> {
+    let mut removed = Vec::new();
+    for f in old_folders {
+        if new_folders.iter().any(|n| n.eq_ignore_ascii_case(f)) {
+            continue;
+        }
+        let owned_by_me = owned
+            .get(&f.to_lowercase())
+            .map(|k| k.eq_ignore_ascii_case(my_key))
+            .unwrap_or(false);
+        if !owned_by_me {
+            continue; // not ours to remove
+        }
+        if !is_safe_folder_name(f) {
+            continue;
+        }
+        let path = addons_dir.join(f);
+        if path.is_dir() && std::fs::remove_dir_all(&path).is_ok() {
+            removed.push(f.clone());
+        }
+    }
+    removed
 }
 
 /// Total size in bytes of a directory tree (missing/erroneous entries ignored).
@@ -621,7 +734,8 @@ mod tests {
         ]);
         let mut f1 = remote(&z1);
         f1.version = "1.2.0".into();
-        let out = install_from_bytes(&ctx, &addons, &meta(), &f1, z1.clone(), &mut noop).await.unwrap();
+        let empty_owned = Default::default();
+        let out = install_from_bytes(&ctx, &addons, &meta(), &f1, z1.clone(), &empty_owned, "curse:1", &mut noop).await.unwrap();
         assert_eq!(out.folders, vec!["Test".to_string()]);
         assert_eq!(out.version.as_deref(), Some("1.2.0"));
         assert_eq!(out.interfaces, vec![16001]);
@@ -637,11 +751,12 @@ mod tests {
         let mut f2 = remote(&z2);
         f2.version = "1.3.0".into();
         f2.file_id = "f-2".into();
-        let out2 = install_from_bytes(&ctx, &addons, &meta(), &f2, z2.clone(), &mut noop).await.unwrap();
+        let out2 = install_from_bytes(&ctx, &addons, &meta(), &f2, z2.clone(), &empty_owned, "curse:1", &mut noop).await.unwrap();
         assert_eq!(out2.version.as_deref(), Some("1.3.0"));
         assert_eq!(std::fs::read(addons.join("Test").join("Core.lua")).unwrap(), b"-- v2\n");
-        let backups = fa_tmp_dir(&addons).join("backup");
-        assert!(backups.is_dir(), "backup snapshots were created");
+        let backups = fa_tmp_dir(&addons).join("backup").join("curse_1");
+        assert!(backups.is_dir(), "per-addon backup snapshots were created");
+        assert_eq!(std::fs::read_dir(&backups).unwrap().count(), 1);
 
         // corrupt zip (truncated) → error, installed v2 stays intact
         let mut truncated = z2.clone();
@@ -649,7 +764,7 @@ mod tests {
         let mut fb = remote(&truncated); // hashes recomputed on truncated bytes
         fb.md5 = Some(hex_md5(&truncated));
         fb.sha1 = Some(hex_sha1(&truncated));
-        let err = install_from_bytes(&ctx, &addons, &meta(), &fb, truncated, &mut noop).await;
+        let err = install_from_bytes(&ctx, &addons, &meta(), &fb, truncated, &empty_owned, "curse:1", &mut noop).await;
         assert!(err.is_err(), "corrupt archive must fail: {err:?}");
         assert_eq!(std::fs::read(addons.join("Test").join("Core.lua")).unwrap(), b"-- v2\n");
     }
@@ -661,13 +776,14 @@ mod tests {
         let z = build_zip(&[("X/X.toc", &toc_body("X", "1.0"))]);
         let mut f = remote(&z);
         f.md5 = Some("00000000000000000000000000000000".into());
-        let err = install_from_bytes(&ctx, &addons, &meta(), &f, z.clone(), &mut |_| {})
+        let empty_owned = Default::default();
+        let err = install_from_bytes(&ctx, &addons, &meta(), &f, z.clone(), &empty_owned, "curse:1", &mut |_| {})
             .await
             .expect_err("md5 mismatch must fail");
         assert!(err.to_string().contains("md5"));
         let mut f2 = remote(&z);
         f2.sha1 = Some("0000000000000000000000000000000000000000".into());
-        assert!(install_from_bytes(&ctx, &addons, &meta(), &f2, z, &mut |_| {}).await.is_err());
+        assert!(install_from_bytes(&ctx, &addons, &meta(), &f2, z, &empty_owned, "curse:1", &mut |_| {}).await.is_err());
         assert_eq!(std::fs::read_dir(&addons).unwrap().count(), 0);
     }
 
@@ -678,7 +794,8 @@ mod tests {
         for bad in ["../evil.txt", "/etc/evil.txt", "C:/Windows/evil.txt", "a/../../evil.lua"] {
             let z = build_zip(&[("Good/Good.toc", &toc_body("Good", "1")), (bad, b"x".as_slice())]);
             let f = remote(&z);
-            let err = install_from_bytes(&ctx, &addons, &meta(), &f, z, &mut |_| {})
+            let empty_owned = Default::default();
+            let err = install_from_bytes(&ctx, &addons, &meta(), &f, z, &empty_owned, "curse:1", &mut |_| {})
                 .await
                 .expect_err(&format!("{bad} must be rejected"));
             assert!(err.to_string().contains("unsafe"), "{bad}: {err}");
@@ -699,7 +816,8 @@ mod tests {
         ]);
         let mut f = remote(&z);
         f.file_name = "bundle.zip".into();
-        let out = install_from_bytes(&ctx, &addons, &meta(), &f, z, &mut |_| {}).await.unwrap();
+        let empty_owned = Default::default();
+        let out = install_from_bytes(&ctx, &addons, &meta(), &f, z, &empty_owned, "curse:1", &mut |_| {}).await.unwrap();
         assert_eq!(out.folders, vec!["Bundle", "Bundle_Libs"]);
         assert!(!addons.join("README.md").exists());
 
@@ -707,7 +825,7 @@ mod tests {
         let z2 = build_zip(&[("Loose.toc", &toc_body("Loose", "0.1")), ("Loose.lua", b"--\n".as_slice())]);
         let mut f2 = remote(&z2);
         f2.file_name = "loose-thing.zip".into();
-        let out2 = install_from_bytes(&ctx, &addons, &meta(), &f2, z2, &mut |_| {}).await.unwrap();
+        let out2 = install_from_bytes(&ctx, &addons, &meta(), &f2, z2, &empty_owned, "curse:1", &mut |_| {}).await.unwrap();
         assert_eq!(out2.folders, vec!["loose-thing".to_string()]);
         assert!(!addons.join("loose-thing").join("Loose.toc").is_dir());
         assert!(addons.join("loose-thing").join("Loose.toc").is_file());
@@ -724,9 +842,7 @@ mod tests {
         std::fs::create_dir_all(addons.join("B")).unwrap();
         std::fs::write(addons.join("B").join("b.txt"), b"old B").unwrap();
 
-        let backup = fa_tmp_dir(&addons).join("backup").join("999");
-        copy_dir_all(&addons.join("A"), &backup.join("A")).unwrap();
-        copy_dir_all(&addons.join("B"), &backup.join("B")).unwrap();
+        let backup = fa_tmp_dir(&addons).join("backup").join("k").join("999");
 
         let extract = fa_tmp_dir(&addons).join("extract").join("t");
         std::fs::create_dir_all(extract.join("A")).unwrap();
@@ -741,8 +857,9 @@ mod tests {
             (extract.join("B"), "B".to_string()),
         ];
         let names: Vec<String> = vec!["A".into(), "B".into()];
-        assert!(do_swap(&addons, &roots, &names).is_err());
-        restore_backups(&backup, &names, &addons);
+        let err = do_swap(&addons, &roots, &names, &backup).expect_err("swap must fail");
+        // AF-07: restore failures are reported, success is silent
+        assert!(!err.to_string().contains("ROLLBACK FAILED"), "{err}");
         assert_eq!(std::fs::read(addons.join("A").join("a.txt")).unwrap(), b"old A");
         assert_eq!(std::fs::read(addons.join("B").join("b.txt")).unwrap(), b"old B");
     }
@@ -752,10 +869,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("backup");
         for ts in [1, 2, 3, 4, 5] {
-            std::fs::create_dir_all(root.join(ts.to_string())).unwrap();
+            std::fs::create_dir_all(root.join("curse_1").join(ts.to_string())).unwrap();
         }
-        prune_backups(&root, 3).unwrap();
-        let mut left: Vec<String> = std::fs::read_dir(&root)
+        prune_backups(&root, "curse:1", 3).unwrap();
+        let mut left: Vec<String> = std::fs::read_dir(&root.join("curse_1"))
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
             .collect();
@@ -824,5 +941,93 @@ mod tests {
         assert_eq!(zip_stem("my-addon-1.2.3.zip"), "my-addon-1.2.3");
         assert_eq!(zip_stem("path/to/weird..name.zip"), "weird..name");
         assert_eq!(zip_stem("/"), "addon");
+    }
+
+    #[tokio::test]
+    async fn archive_cannot_clobber_a_foreign_owned_folder() {
+        // AF-06: an archive shipping a folder owned by another addon is
+        // rejected; the victim's bytes stay untouched.
+        let (_tmp, addons) = fixture();
+        let ctx = ctx();
+        std::fs::create_dir_all(addons.join("Victim")).unwrap();
+        std::fs::write(addons.join("Victim").join("v.toc"), toc_body("Victim", "9.9")).unwrap();
+
+        let owned: std::collections::BTreeMap<String, String> =
+            [("victim".to_string(), "curse:777".to_string())].into_iter().collect();
+        let z = build_zip(&[
+            ("Attacker/Attacker.toc", &toc_body("Attacker", "1.0")),
+            ("Victim/Victim.toc", &toc_body("Victim", "1.0")),
+        ]);
+        let f = remote(&z);
+        let err = install_from_bytes(&ctx, &addons, &meta(), &f, z, &owned, "curse:1", &mut |_| {})
+            .await
+            .expect_err("foreign folder must be refused");
+        assert!(err.to_string().contains("owned by curse:777"), "{err}");
+        assert_eq!(
+            std::fs::read(addons.join("Victim").join("v.toc")).unwrap(),
+            toc_body("Victim", "9.9")
+        );
+        assert!(!addons.join("Attacker").exists(), "nothing installs on refusal");
+    }
+
+    #[test]
+    fn dropped_roots_cleanup_respects_ownership() {
+        // AF-08: old-owned, new-dropped folders go away; foreign-owned stay.
+        let (_tmp, addons) = fixture();
+        for (dir, content) in [("Old_Mod", b"mine".as_slice()), ("Shared_Libs", b"theirs".as_slice())] {
+            std::fs::create_dir_all(addons.join(dir)).unwrap();
+            std::fs::write(addons.join(dir).join("f.lua"), content).unwrap();
+        }
+        let owned: std::collections::BTreeMap<String, String> = [
+            ("old_mod".to_string(), "curse:1".to_string()),
+            ("shared_libs".to_string(), "curse:2".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let old = vec!["Old_Mod".to_string(), "Shared_Libs".to_string(), "Gone".to_string()];
+        let new = vec!["Main".to_string()];
+        let removed = cleanup_dropped_roots(&addons, &old, &new, &owned, "curse:1");
+        assert_eq!(removed, vec!["Old_Mod".to_string()]);
+        assert!(!addons.join("Old_Mod").exists());
+        assert!(addons.join("Shared_Libs").exists(), "foreign folder untouched");
+    }
+
+    #[test]
+    fn backups_pruned_per_addon_key() {
+        // AF-09: retention is per addon key; keep=0 drops all snapshots.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("backup");
+        for (key, ts) in [("curse:1", 10), ("curse:1", 20), ("curse:1", 30), ("github:a_b", 15)] {
+            std::fs::create_dir_all(root.join(snapshot_slug(key)).join(ts.to_string())).unwrap();
+        }
+        prune_backups(&root, "curse:1", 2).unwrap();
+        let c1: Vec<String> = std::fs::read_dir(root.join("curse_1"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(c1.len(), 2);
+        assert!(root.join("github_a_b").join("15").exists(), "other keys untouched");
+        prune_backups(&root, "curse:1", 0).unwrap();
+        assert_eq!(std::fs::read_dir(root.join("curse_1")).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn entry_count_cap_rejects() {
+        // R-03: absurd entry counts are refused before extraction.
+        let (_tmp, addons) = fixture();
+        let ctx = ctx();
+        let mut z = ZipWriter::new(Cursor::new(Vec::new()));
+        let opts = SimpleFileOptions::default();
+        for i in 0..(MAX_ENTRIES + 1) {
+            z.start_file(format!("Big/Pad{i}.lua"), opts).unwrap();
+            z.write_all(b"x").unwrap();
+        }
+        let bytes = z.finish().unwrap().into_inner();
+        let f = remote(&bytes);
+        let empty_owned = Default::default();
+        let err = install_from_bytes(&ctx, &addons, &meta(), &f, bytes, &empty_owned, "curse:1", &mut |_| {})
+            .await
+            .expect_err("entry cap must reject");
+        assert!(err.to_string().contains("too many entries"), "{err}");
     }
 }

@@ -459,6 +459,8 @@ impl Worker {
         let name = st.name.clone();
         let sel = self.sel(st.channel);
         let provider = reg.get(st.provider);
+        let owned = self.store.folder_owners();
+        let old_folders = st.folders.clone();
         let res: Result<(), String> = async {
             let metas = provider.meta(&self.ctx, std::slice::from_ref(&st.external_id)).await.map_err(|e| e.to_string())?;
             let meta = metas.into_iter().next().ok_or("provider returned no data")?;
@@ -483,7 +485,7 @@ impl Worker {
                     });
                 }
             };
-            let outcome = install::install(&self.ctx, &dir, &meta, &file, &mut prog)
+            let outcome = install::install(&self.ctx, &dir, &meta, &file, &owned, &key, &mut prog)
                 .await
                 .map_err(|e| e.to_string())?;
             if let Some(st) = self.store.addons.get_mut(&key) {
@@ -493,6 +495,9 @@ impl Worker {
                 st.size_bytes = outcome.size_bytes;
                 st.pending_update = None;
                 st.cached_remote = Some(meta.clone());
+            }
+            for r in install::cleanup_dropped_roots(&dir, &old_folders, &outcome.folders, &owned, &key) {
+                self.log(format!("removed folder {r}, dropped by the update of {name}"));
             }
             let _ = ev.send(Ev::InstallDone { key: key.clone(), name: name.clone(), version: outcome.version });
             self.check_install_deps(&outcome.folders, &name).await;
@@ -516,6 +521,7 @@ impl Worker {
         let key = AddonState::key(provider, &external_id);
         let sel = self.sel(self.cfg.updates.channel);
         let prov = reg.get(provider);
+        let owned = self.store.folder_owners();
         let res: Result<(), String> = async {
             let metas = prov.meta(&self.ctx, std::slice::from_ref(&external_id)).await.map_err(|e| e.to_string())?;
             let meta = metas.into_iter().next().ok_or("provider returned no data")?;
@@ -538,7 +544,7 @@ impl Worker {
                     });
                 }
             };
-            let outcome = install::install(&self.ctx, &dir, &meta, &file, &mut prog)
+            let outcome = install::install(&self.ctx, &dir, &meta, &file, &owned, &key, &mut prog)
                 .await
                 .map_err(|e| e.to_string())?;
             let mut st = AddonState {
