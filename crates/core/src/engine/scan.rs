@@ -77,7 +77,14 @@ pub async fn scan_addons(
     sel: &FileSelect,
     on_progress: &mut (dyn FnMut(&str, usize, usize) + Send),
 ) -> Result<ScanReport> {
-    let folders = scan_folders(addons_dir, sel.flavor)?;
+    // AF-24: the local walk is blocking filesystem work; run it off the
+    // async worker so timeouts, the UI event loop, and other jobs are not
+    // stalled by a slow disk
+    let dir = addons_dir.to_path_buf();
+    let flavor = sel.flavor;
+    let folders = tokio::task::spawn_blocking(move || scan_folders(&dir, flavor))
+        .await
+        .map_err(|e| crate::error::Error::provider("scan", format!("scan task failed: {e}")))??;
     let reg = Registry::new(ctx);
     let providers: Vec<&dyn Provider> =
         Registry::scan_order().iter().map(|k| reg.get(*k)).collect();

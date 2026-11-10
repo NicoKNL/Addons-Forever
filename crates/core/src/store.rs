@@ -109,6 +109,14 @@ impl StateStore {
                 changed = true;
             }
         }
+        // drop sections for addons no longer in the store (uninstalled,
+        // re-keyed sources); they can only reappear via a scan
+        let live: std::collections::HashSet<&String> = self.addons.keys().collect();
+        let stale: Vec<String> = cfg.addons.keys().filter(|k| !live.contains(k)).cloned().collect();
+        for k in stale {
+            cfg.addons.remove(&k);
+            changed = true;
+        }
         changed
     }
 
@@ -120,12 +128,24 @@ impl StateStore {
         let mut changed = false;
         let legacy = data_dir.join("state.json");
         if legacy.exists() {
-            if let Ok(text) = std::fs::read_to_string(&legacy) {
-                if let Ok(store) = serde_json::from_str::<StateStore>(&text) {
-                    changed |= store.write_overrides(cfg);
+            // AF-15: the input is only retired after a clean fold, and it is
+            // renamed (kept as `state.json.migrated`), never deleted: a
+            // corrupt, unreadable, or uncommitted migration must not destroy
+            // the last copy of the user's old state.
+            let folded = std::fs::read_to_string(&legacy)
+                .map_err(|e| tracing::warn!("legacy state unreadable: {e}; keeping state.json"))
+                .and_then(|text| {
+                    serde_json::from_str::<StateStore>(&text)
+                        .map_err(|e| tracing::warn!("legacy state corrupt: {e}; keeping state.json"))
+                });
+            if let Ok(store) = folded {
+                changed |= store.write_overrides(cfg);
+                let kept = data_dir.join("state.json.migrated");
+                match std::fs::rename(&legacy, &kept) {
+                    Ok(()) => tracing::info!("legacy state folded into the ini; original kept as state.json.migrated"),
+                    Err(e) => tracing::warn!("could not retire state.json: {e}"),
                 }
             }
-            let _ = std::fs::remove_file(&legacy);
         }
         let _ = std::fs::remove_dir_all(data_dir.join("logs"));
         let _ = std::fs::remove_file(data_dir.join("egui-ui.toml"));
@@ -214,10 +234,25 @@ mod tests {
         assert!(StateStore::migrate_into_cfg(&dir, &mut cfg));
         assert_eq!(cfg.addons["curse:2382"].auto_update, Some(true));
         assert!(!dir.join("state.json").exists());
+        assert!(dir.join("state.json.migrated").exists(), "original retained, not deleted");
         assert!(!dir.join("egui-ui.toml").exists());
         assert!(!dir.join("logs").exists());
         // second run is a no-op
         assert!(!StateStore::migrate_into_cfg(&dir, &mut cfg));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn migrate_keeps_corrupt_legacy_file() {
+        // AF-15: a legacy file that fails to parse must never be destroyed;
+        // nothing is folded and the input stays in place for recovery.
+        let dir = std::env::temp_dir().join(format!("fa-mig-bad-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("state.json"), b"{ not json").unwrap();
+        let mut cfg = AppConfig::default();
+        assert!(!StateStore::migrate_into_cfg(&dir, &mut cfg));
+        assert!(dir.join("state.json").exists(), "corrupt input is not deleted");
+        assert!(cfg.addons.is_empty());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

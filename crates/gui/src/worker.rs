@@ -284,6 +284,10 @@ impl Worker {
     }
 
     async fn do_scan(&mut self) {
+        // AF-24: a direct scan is its own generation: results that race a
+        // later config/flavor change are dropped, not committed
+        self.gen += 1;
+        let my_gen = self.gen;
         let Some(dir) = self.addons_dir() else {
             let set = self
                 .cfg
@@ -311,6 +315,10 @@ impl Worker {
         let fut = scan::scan_addons(&self.ctx, &dir, &sel, &mut progress);
         match tokio::time::timeout(std::time::Duration::from_secs(120), fut).await {
             Ok(Ok(report)) => {
+                if my_gen != self.gen {
+                    self.log("scan superseded by a newer one; result dropped");
+                    return;
+                }
                 let matched = report.matched.len();
                 let unmatched = report.unmatched.len();
                 scan::apply_scan_report(&mut self.store, &report, &self.cfg);
@@ -765,7 +773,14 @@ impl Worker {
         let _ = self.ev.send(Ev::ChangelogDone { key, title, text });
     }
 
-    fn do_save_config(&mut self, new_cfg: AppConfig, path: &Path) {
+    fn do_save_config(&mut self, mut new_cfg: AppConfig, path: &Path) {
+        // AF-13: the settings form carries a GUI-side snapshot; the worker's
+        // [addon ...] intent (auto-update, channel, ignored, pins written
+        // since the form opened) is newer and must survive the whole-config
+        // replacement.
+        for (k, v) in self.cfg.addons.clone() {
+            new_cfg.addons.insert(k, v);
+        }
         if let Err(e) = new_cfg.save(path) {
             let _ = self.ev.send(Ev::Failed { key: "config".into(), msg: format!("Save: {e}") });
             return;
