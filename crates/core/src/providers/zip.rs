@@ -121,6 +121,7 @@ impl Provider for ZipProvider {
     }
 
     async fn meta(&self, ctx: &AppCtx, ids: &[String]) -> Result<Vec<RemoteMeta>> {
+        ctx.ensure_online()?;
         let mut out = Vec::new();
         for raw in ids {
             let url = raw.trim();
@@ -158,12 +159,13 @@ impl Provider for ZipProvider {
 
     async fn search(
         &self,
-        _ctx: &AppCtx,
+        ctx: &AppCtx,
         _query: &str,
         _page: u32,
         _per_page: u32,
         _sel: &FileSelect,
     ) -> Result<SearchPage> {
+        ctx.ensure_online()?;
         Err(Error::Unsupported(
             "Zip URL installs have no catalog — paste a direct download URL".into(),
         ))

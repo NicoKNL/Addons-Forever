@@ -514,6 +514,7 @@ impl Provider for GitHubProvider {
     }
 
     async fn meta(&self, ctx: &AppCtx, ids: &[String]) -> Result<Vec<RemoteMeta>> {
+        ctx.ensure_online()?;
         let mut out = Vec::new();
         for raw in ids {
             let Some(repo_id) = parse_repo_id(raw) else {
@@ -561,6 +562,7 @@ impl Provider for GitHubProvider {
     }
 
     async fn scan(&self, ctx: &AppCtx, req: &ScanRequest<'_>) -> Result<Vec<ScanMatch>> {
+        ctx.ensure_online()?;
         let mut by_repo: BTreeMap<String, Vec<&crate::types::FolderInfo>> = BTreeMap::new();
         for folder in req.folders {
             if let Some(repo) = repo_from_toc(&folder.toc) {
@@ -605,12 +607,13 @@ impl Provider for GitHubProvider {
 
     async fn search(
         &self,
-        _ctx: &AppCtx,
+        ctx: &AppCtx,
         _query: &str,
         _page: u32,
         _per_page: u32,
         _sel: &FileSelect,
     ) -> Result<SearchPage> {
+        ctx.ensure_online()?;
         Err(Error::Unsupported(
             "GitHub has no reliable addon catalog — paste a repository URL \
              (https://github.com/owner/repo) to install from GitHub"

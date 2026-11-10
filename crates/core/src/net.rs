@@ -89,6 +89,9 @@ pub fn build_client(user_agent: &str) -> reqwest::Client {
         .connect_timeout(Duration::from_secs(15))
         .redirect(reqwest::redirect::Policy::custom(|attempt| {
             // privacy: never follow a redirect off the allowlist
+            if attempt.previous().len() >= 10 {
+                return attempt.error("too many redirects");
+            }
             if host_allowed(attempt.url().as_str()) {
                 attempt.follow()
             } else {

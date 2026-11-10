@@ -426,6 +426,7 @@ impl Provider for HubProvider {
     }
 
     async fn meta(&self, ctx: &AppCtx, ids: &[String]) -> Result<Vec<RemoteMeta>> {
+        ctx.ensure_online()?;
         let mut out = Vec::new();
         for raw in ids {
             let Some(id) = clean_id(raw) else {
@@ -453,6 +454,7 @@ impl Provider for HubProvider {
     }
 
     async fn scan(&self, ctx: &AppCtx, req: &ScanRequest<'_>) -> Result<Vec<ScanMatch>> {
+        ctx.ensure_online()?;
         let scanned: HashSet<String> = req.folders.iter().map(|f| f.name.clone()).collect();
         // repo/folder-name → best addon match (cached per name)
         let mut claims: Vec<(HubAddon, String, f64)> = Vec::new(); // addon, folder name, score
@@ -543,6 +545,7 @@ impl Provider for HubProvider {
         per_page: u32,
         sel: &FileSelect,
     ) -> Result<SearchPage> {
+        ctx.ensure_online()?;
         let q = query.trim();
         if q.chars().count() < 2 {
             return Err(Error::provider(

@@ -102,6 +102,10 @@ pub(crate) async fn scan_with_providers(
         if remaining.is_empty() {
             break;
         }
+        if ctx.cfg.network.offline {
+            // offline mode: keep the local inventory, make zero requests
+            break;
+        }
         let req = ScanRequest { folders: &remaining, sel };
         let found = match provider.scan(ctx, &req).await {
             Ok(m) => m,
@@ -328,6 +332,50 @@ mod tests {
             cfg: std::sync::Arc::new(AppConfig::default()),
             app_version: "test",
         }
+    }
+
+    fn offline_ctx() -> AppCtx {
+        let mut cfg = AppConfig::default();
+        cfg.network.offline = true;
+        AppCtx {
+            http: crate::net::build_client("test/0"),
+            cfg: std::sync::Arc::new(cfg),
+            app_version: "test",
+        }
+    }
+
+    #[tokio::test]
+    async fn offline_scan_makes_zero_provider_calls() {
+        // AF-01 regression: with offline mode on, a scan keeps the local
+        // inventory and touches no provider at all.
+        let (_tmp, addons) = fixture();
+        let folders = scan_folders(&addons, Flavor::Forever).unwrap();
+        let n = folders.len();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mock = MockProvider {
+            kind: ProviderKind::Curse,
+            claims: vec!["Alpha".into()],
+            requests: Arc::new(Mutex::new(vec![])),
+            calls: calls.clone(),
+        };
+        let report = scan_with_providers(
+            &offline_ctx(),
+            &[&mock],
+            folders,
+            &sel(),
+            &mut |_, _, _| {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "offline must not call providers");
+        assert!(report.matched.is_empty());
+        assert_eq!(report.unmatched.len(), n, "folders stay as local inventory");
+    }
+
+    #[test]
+    fn ensure_online_gate() {
+        assert!(ctx().ensure_online().is_ok());
+        assert!(offline_ctx().ensure_online().is_err());
     }
 
     fn sel() -> FileSelect {

@@ -742,6 +742,10 @@ impl Worker {
             return;
         }
         let old_flavor = self.cfg.app.flavor;
+        let old_dir = (
+            self.cfg.app.addons_dir.clone().unwrap_or_default(),
+            self.cfg.app.auto_detect,
+        );
         self.cfg = Arc::new(new_cfg);
         self.ctx = AppCtx::new(self.cfg.clone(), self.ctx.app_version);
         self.setup_watcher();
@@ -757,6 +761,21 @@ impl Worker {
             self.log(format!("switched to {}; rescanning", f.label()));
             self.emit_state();
             self.start_scan();
+        } else {
+            // same flavor: a changed AddOns target is a different installation.
+            // Drop the old rows so an operation can never act on the previous
+            // folder set, then rescan the new one.
+            let new_dir = (
+                self.cfg.app.addons_dir.clone().unwrap_or_default(),
+                self.cfg.app.auto_detect,
+            );
+            if new_dir != old_dir {
+                self.gen += 1; // supersede in-flight scans of the old directory
+                self.store = StateStore::default();
+                self.log("AddOns directory changed; inventory cleared, rescanning");
+                self.emit_state();
+                self.start_scan();
+            }
         }
     }
 
@@ -828,6 +847,12 @@ impl Worker {
     }
 
     fn do_self_update(&mut self) {
+        if self.cfg.network.offline {
+            let _ = self.ev.send(Ev::SelfUpdateDone {
+                info: "offline mode: the app will not download anything, including its own update".into(),
+            });
+            return;
+        }
         let ev = self.ev.clone();
         let Some(repo) = self
             .cfg
@@ -899,7 +924,11 @@ async fn run(
     // startup jobs
     let cfg0 = w.cfg.clone();
     if cfg0.app.addons_dir.is_some() || cfg0.app.auto_detect {
-        w.do_scan().await;
+        if cfg0.ui.scan_on_start {
+            w.do_scan().await;
+        } else {
+            w.log("startup scan disabled ([ui] scan_on_start = false)");
+        }
         if cfg0.updates.check_on_startup {
             let updates = w.do_check().await;
             if cfg0.updates.auto_update {

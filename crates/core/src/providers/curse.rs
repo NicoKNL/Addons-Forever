@@ -785,6 +785,7 @@ impl Provider for CurseProvider {
     }
 
     async fn meta(&self, ctx: &AppCtx, ids: &[String]) -> Result<Vec<RemoteMeta>> {
+        ctx.ensure_online()?;
         let mut out = Vec::new();
         for raw in ids {
             let id = raw.trim();
@@ -820,6 +821,7 @@ impl Provider for CurseProvider {
     }
 
     async fn scan(&self, ctx: &AppCtx, req: &ScanRequest<'_>) -> Result<Vec<ScanMatch>> {
+        ctx.ensure_online()?;
         let mut out: Vec<ScanMatch> = Vec::new();
         let mut claimed: HashSet<String> = HashSet::new();
 
@@ -931,6 +933,7 @@ impl Provider for CurseProvider {
         per_page: u32,
         sel: &FileSelect,
     ) -> Result<SearchPage> {
+        ctx.ensure_online()?;
         let per = per_page.clamp(1, 50);
         // `page` is 0-based (the API `index` is an offset = page * per_page).
         let index = page.saturating_mul(per);
@@ -964,6 +967,7 @@ impl Provider for CurseProvider {
         meta: &RemoteMeta,
         file: &RemoteFile,
     ) -> Result<Option<String>> {
+        ctx.ensure_online()?;
         if file.file_id.is_empty() || !file.file_id.bytes().all(|c| c.is_ascii_digit()) {
             return Ok(file
                 .changelog_url

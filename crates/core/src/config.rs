@@ -268,13 +268,13 @@ impl AppConfig {
         s
     }
 
-    /// Effective AddOns directory: explicit config, else auto-detection.
+    /// Effective AddOns directory. An explicit path wins outright: the app
+    /// never silently substitutes an auto-detected installation for a
+    /// configured one (a stale row must not end up mutating a different
+    /// AddOns folder). Auto-detection runs only when no path is set.
     pub fn addons_dir(&self) -> Option<PathBuf> {
         if let Some(p) = self.app.addons_dir.as_deref().filter(|p| !p.trim().is_empty()) {
-            let path = PathBuf::from(p);
-            if path.is_dir() {
-                return Some(path);
-            }
+            return Some(PathBuf::from(p));
         }
         if self.app.auto_detect {
             return autodetect_addons_dir(self.app.flavor);
@@ -555,9 +555,12 @@ mod tests {
         .unwrap();
         let cfg = AppConfig::load(&p).unwrap();
         assert_eq!(cfg.app.addons_dir.as_deref(), Some(win_path));
-        // the path parses intact; on this machine it is not a directory, so
-        // the effective dir is None (auto-detect off)
-        assert_eq!(cfg.addons_dir(), None);
+        // fail-closed: the configured path is the effective dir even where
+        // that path is not a directory (no silent auto-detect fallback)
+        assert_eq!(
+            cfg.addons_dir(),
+            Some(std::path::PathBuf::from(win_path))
+        );
 
         // full production roundtrip: save writes the path raw, load reads it back
         let mut cfg2 = AppConfig::default();

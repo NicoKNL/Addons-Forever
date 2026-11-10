@@ -322,6 +322,7 @@ impl Provider for TukuiProvider {
     }
 
     async fn meta(&self, ctx: &AppCtx, ids: &[String]) -> Result<Vec<RemoteMeta>> {
+        ctx.ensure_online()?;
         let list = self.fresh_list(ctx).await?;
         let mut out = Vec::new();
         for id in ids {
@@ -341,6 +342,7 @@ impl Provider for TukuiProvider {
     }
 
     async fn scan(&self, ctx: &AppCtx, req: &ScanRequest<'_>) -> Result<Vec<ScanMatch>> {
+        ctx.ensure_online()?;
         let list = self.fresh_list(ctx).await?;
         let by_id: BTreeMap<String, &TukuiAddon> =
             list.iter().map(|a| (a.id.to_string(), a)).collect();
@@ -413,6 +415,7 @@ impl Provider for TukuiProvider {
         per_page: u32,
         _sel: &FileSelect,
     ) -> Result<SearchPage> {
+        ctx.ensure_online()?;
         let list = self.list(ctx).await?;
         let q = query.trim().to_ascii_lowercase();
         let items: Vec<SearchItem> = list

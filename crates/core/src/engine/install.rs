@@ -389,6 +389,7 @@ pub async fn install(
     file: &RemoteFile,
     on_progress: &mut (dyn FnMut(InstallProgress) + Send),
 ) -> Result<InstallOutcome> {
+    ctx.ensure_online()?;
     let bytes = download_zip(ctx, addons_dir, meta, file, &mut |bytes, total| {
         on_progress(InstallProgress::Downloading { bytes, total });
     })

@@ -199,6 +199,20 @@ impl AppCtx {
         let ua = cfg.user_agent(app_version);
         AppCtx { http: crate::net::build_client(&ua), cfg, app_version }
     }
+
+    /// `[network] offline` enforcement. Every code path that can touch the
+    /// network calls this first, so the checkbox is a real boundary: with it
+    /// on, requests fail before connecting (the GUI's local features keep
+    /// working, including a local-only scan).
+    pub fn ensure_online(&self) -> crate::error::Result<()> {
+        if self.cfg.network.offline {
+            return Err(crate::error::Error::provider(
+                "offline",
+                "offline mode is on, network access denied (turn it off in Settings)",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// What "compatible with my client" means when picking files.

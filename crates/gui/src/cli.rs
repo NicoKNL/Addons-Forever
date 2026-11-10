@@ -283,6 +283,9 @@ async fn dispatch(data_dir: &std::path::Path, config_path: &std::path::Path, cfg
             println!("offline = {}", c.network.offline);
         }
         "selfupdate" => {
+            if cfg.network.offline {
+                return Err("offline mode is on; the CLI will not download its own update".into());
+            }
             let repo = cfg
                 .app
                 .update_repo

@@ -322,6 +322,7 @@ impl Provider for MmouiProvider {
     }
 
     async fn meta(&self, ctx: &AppCtx, ids: &[String]) -> Result<Vec<RemoteMeta>> {
+        ctx.ensure_online()?;
         let wanted = clean_ids(ids);
         let mut found: BTreeMap<String, RemoteMeta> = BTreeMap::new();
 
@@ -365,6 +366,7 @@ impl Provider for MmouiProvider {
     }
 
     async fn scan(&self, ctx: &AppCtx, req: &ScanRequest<'_>) -> Result<Vec<ScanMatch>> {
+        ctx.ensure_online()?;
         let mut by_id = wowi_folders(req.folders);
         if by_id.is_empty() {
             return Ok(Vec::new());
@@ -394,12 +396,13 @@ impl Provider for MmouiProvider {
 
     async fn search(
         &self,
-        _ctx: &AppCtx,
+        ctx: &AppCtx,
         _query: &str,
         _page: u32,
         _per_page: u32,
         _sel: &FileSelect,
     ) -> Result<SearchPage> {
+        ctx.ensure_online()?;
         Err(Error::Unsupported(
             "MMOUI/WoWInterface has no search API. Install by pasting a wowinterface.com \
              file id (e.g. 8814) or download URL; addons declaring ## X-WoWI-ID: are \
@@ -410,10 +413,11 @@ impl Provider for MmouiProvider {
 
     async fn changelog(
         &self,
-        _ctx: &AppCtx,
+        ctx: &AppCtx,
         _meta: &RemoteMeta,
         file: &RemoteFile,
     ) -> Result<Option<String>> {
+        ctx.ensure_online()?;
         // MMOUI ships the changelog text (not a url) inside the file record
         match file.changelog_url.as_deref().map(str::trim) {
             Some(t) if !t.is_empty() && !t.starts_with("http") => Ok(Some(t.to_string())),
