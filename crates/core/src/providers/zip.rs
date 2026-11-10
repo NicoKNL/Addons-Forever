@@ -99,7 +99,14 @@ fn header_str(resp: &reqwest::Response, name: &str) -> Option<String> {
 /// HEAD the URL, falling back to GET when the server rejects HEAD. Allowlist
 /// enforced via `net` (user-added hosts are checked at download by the engine).
 async fn probe(ctx: &AppCtx, url: &str) -> Result<reqwest::Response> {
-    net::ensure_allowed(url, &[])?;
+    // AF-19: the URL the user supplied is itself the authorization; authorize
+    // the host for probe, download, and redirects on this exact origin.
+    let host = reqwest::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(|h| h.to_string()))
+        .ok_or_else(|| Error::provider("Zip URL", format!("cannot parse URL: {url}")))?;
+    net::ensure_allowed(url, &[host.clone()])?;
+    net::authorize_host(&host);
     let head = ctx.http.head(url).send().await?;
     if head.status().is_success() {
         return Ok(head);
@@ -249,10 +256,19 @@ mod tests {
                 .await
                 .unwrap_err();
             assert!(matches!(err, Error::Unsupported(_)), "{err}");
-            // meta on a non-allowlisted host is blocked by the privacy layer
+            // AF-19: the URL the user supplied is the authorization; the
+            // probe for a plain https host outside the provider list is no
+            // longer blocked (it reaches the network: a transport error, not
+            // Error::Blocked, proves the authorization)
             let ids = ["https://evil.example/addon.zip".to_string()];
             let err = ZipProvider.meta(&ctx, &ids).await.unwrap_err();
-            assert!(matches!(err, Error::Blocked { .. }), "{err}");
+            assert!(!matches!(err, Error::Blocked { .. }), "user host must be authorized: {err}");
+            // plaintext is still refused (meta skips non-https URLs; the
+            // privacy layer refuses them outright)
+            assert!(
+                crate::net::ensure_allowed("http://evil.example/addon.zip", &["evil.example".into()]).is_err(),
+                "http must never be allowed, even for a user host"
+            );
         });
     }
 }

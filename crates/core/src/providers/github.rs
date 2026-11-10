@@ -437,8 +437,14 @@ fn file_rank(f: &RemoteFile, sel: &FileSelect) -> Option<(u8, i64, u8, Vec<u64>)
 async fn gh_send(ctx: &AppCtx, url: &str, accept: &str) -> Result<reqwest::Response> {
     net::ensure_allowed(url, &[])?;
     let mut req = ctx.http.get(url).header("Accept", accept);
+    // AF-03: the bearer token goes to the API host only (PRIVACY.md), never
+    // to asset download hosts
+    let to_api = reqwest::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(|h| h.eq_ignore_ascii_case("api.github.com")))
+        .unwrap_or(false);
     let token = ctx.cfg.network.github_token.trim();
-    if !token.is_empty() {
+    if !token.is_empty() && to_api {
         req = req.bearer_auth(token);
     }
     let resp = req.send().await?;

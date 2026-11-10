@@ -35,18 +35,47 @@ pub const ALLOWED_HOSTS: &[&str] = &[
 const MAX_ALLOC_PREFLIGHT: u64 = 512 * 1024 * 1024;
 
 pub fn host_allowed(url: &str) -> bool {
-    let Ok(parsed) = reqwest::Url::parse(url) else {
+    let Some(host) = https_host(url) else {
         return false;
     };
-    match parsed.scheme() {
-        "https" => {}
-        _ => return false,
-    }
-    let Some(host) = parsed.host_str() else {
-        return false;
-    };
-    let host = host.trim_end_matches('.').to_ascii_lowercase();
     ALLOWED_HOSTS.iter().any(|h| host == *h)
+}
+
+fn https_host(url: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(url).ok()?;
+    if parsed.scheme() != "https" {
+        return None;
+    }
+    let host = parsed.host_str()?;
+    Some(host.trim_end_matches('.').to_ascii_lowercase())
+}
+
+static AUTHORIZED_HOSTS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::OnceLock::new();
+
+/// Authorize a user-added host (zip URL installs) for the process lifetime,
+/// including for redirects. The user typing the URL is the authorization;
+/// requests for provider traffic never widen this set.
+pub fn authorize_host(host: &str) {
+    let set = AUTHORIZED_HOSTS.get_or_init(Default::default);
+    if let Ok(mut s) = set.lock() {
+        s.insert(host.trim_end_matches('.').to_ascii_lowercase());
+    }
+}
+
+fn host_authorized(host: &str) -> bool {
+    AUTHORIZED_HOSTS
+        .get()
+        .and_then(|s| s.lock().ok().map(|s| s.contains(host)))
+        .unwrap_or(false)
+}
+
+/// Allowlist plus per-process user authorizations (zip installs).
+fn host_allowed_ext(url: &str) -> bool {
+    match https_host(url) {
+        Some(h) => ALLOWED_HOSTS.iter().any(|a| *a == h) || host_authorized(&h),
+        None => false,
+    }
 }
 
 /// Enforce the allowlist for provider traffic. `extra_hosts` carries the
@@ -96,7 +125,7 @@ pub fn build_client(user_agent: &str) -> reqwest::Client {
             if attempt.previous().len() >= 10 {
                 return attempt.error("too many redirects");
             }
-            if host_allowed(attempt.url().as_str()) {
+            if host_allowed_ext(attempt.url().as_str()) {
                 attempt.follow()
             } else {
                 attempt.stop()

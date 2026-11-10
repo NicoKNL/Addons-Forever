@@ -16,13 +16,35 @@ use app::AppGui;
 
 fn main() -> eframe::Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    if args.get(1).map(|a| a.as_str()) == Some("cli") {
-        std::process::exit(cli::run(&args[2..]));
-    }
+    let is_cli = args.get(1).map(|a| a.as_str()) == Some("cli");
     let data_dir = addons_forever_core::util::data_dir().expect("cannot determine app data directory");
-    let _single = match single::SingleInstanceGuard::acquire(&data_dir) {
+
+    // config first: the instance lock is keyed to the AddOns installation
+    let config_path = addons_forever_core::config::AppConfig::config_path(&data_dir);
+    let mut cfg = match addons_forever_core::config::AppConfig::load(&config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            let msg = format!("Could not read {}:\n{e}", config_path.display());
+            if is_cli {
+                eprintln!("{msg}");
+                std::process::exit(1);
+            }
+            fatal(&msg);
+            return Ok(());
+        }
+    };
+    addons_forever_core::store::StateStore::migrate_into_cfg(&data_dir, &mut cfg);
+    let cfg = Arc::new(cfg);
+
+    // AF-22: the lock covers CLI and GUI alike, keyed to the installation
+    // being mutated, so no two writers race the same AddOns folder
+    let _single = match single::SingleInstanceGuard::acquire(&data_dir, cfg.app.addons_dir.as_deref()) {
         Some(g) => g,
         None => {
+            if is_cli {
+                eprintln!("addons-forever is already running for this installation; close it (or the GUI) first");
+                std::process::exit(1);
+            }
             #[cfg(windows)]
             unsafe {
                 use std::ffi::c_void;
@@ -40,15 +62,9 @@ fn main() -> eframe::Result<()> {
         }
     };
 
-    let config_path = addons_forever_core::config::AppConfig::config_path(&data_dir);
-    let cfg = match addons_forever_core::config::AppConfig::load(&config_path) {
-        Ok(c) => c,
-        Err(e) => {
-            fatal(&format!("Could not read {}:\n{e}", config_path.display()));
-            return Ok(());
-        }
-    };
-    let cfg = Arc::new(cfg);
+    if is_cli {
+        std::process::exit(cli::run(&args[2..], data_dir, cfg));
+    }
 
     init_logging();
     tracing::info!("addons-forever {} starting; data dir {}", env!("CARGO_PKG_VERSION"), data_dir.display());
@@ -165,7 +181,8 @@ fn fatal(msg: &str) {
     unsafe {
         use std::ffi::c_void;
         use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
-        let w: Vec<u16> = msg.encode_utf16().collect();
+        // AF-23: MessageBoxW needs a null-terminated wide string
+        let w: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
         let t: Vec<u16> = "Addons Forever\0".encode_utf16().collect();
         MessageBoxW(std::ptr::null_mut() as *mut c_void, w.as_ptr(), t.as_ptr(), MB_OK | MB_ICONERROR);
     }

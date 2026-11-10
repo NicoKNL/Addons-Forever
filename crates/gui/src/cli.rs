@@ -20,19 +20,9 @@ fn persist_flags(data_dir: &std::path::Path, store: &StateStore) -> Result<(), S
 }
 use addons_forever_core::types::{AppCtx, FileSelect, ProviderKind};
 
-pub fn run(args: &[String]) -> i32 {
+pub fn run(args: &[String], data_dir: std::path::PathBuf, cfg: Arc<AppConfig>) -> i32 {
     attach_console();
-    let data_dir = match addons_forever_core::util::data_dir() {
-        Ok(d) => d,
-        Err(e) => return fail(&format!("cannot resolve app data dir: {e}")),
-    };
     let config_path = AppConfig::config_path(&data_dir);
-    let mut cfg = match AppConfig::load(&config_path) {
-        Ok(c) => c,
-        Err(e) => return fail(&format!("config error: {e}")),
-    };
-    StateStore::migrate_into_cfg(&data_dir, &mut cfg);
-    let cfg = Arc::new(cfg);
 
     let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
         Ok(rt) => rt,
